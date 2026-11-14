@@ -113,6 +113,18 @@
           </button>
         </div>
 
+        <div class="btn-row" id="file-vc-controls">
+          <label class="btn btn-secondary file-btn" id="src-file-label">
+            <input type="file" id="src-file-input" accept="audio/*" hidden disabled />
+            📂 ファイルから変換
+          </label>
+          <span class="bench-note" id="file-vc-status">モデル読込後に音声ファイルを入力できます</span>
+        </div>
+        <div class="btn-row" id="file-vc-output" hidden>
+          <audio id="file-vc-player" controls style="flex: 1; min-width: 200px; height: 36px;"></audio>
+          <a id="file-vc-download" class="btn btn-secondary" download="converted.wav">💾 WAV保存</a>
+        </div>
+
         <div class="meters">
           <div class="meter-row">
             <span>Input</span>

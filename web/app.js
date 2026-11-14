@@ -140,6 +140,8 @@
     workletNode: null,
     totalChunks: 0,
     isRecordingRef: false,
+    isConvertingFile: false,
+    fileOutputUrl: null,
   };
 
   // DOM Elements
@@ -161,6 +163,11 @@
     btnToggleVc: document.getElementById("btn-toggle-vc"),
     btnBypass: document.getElementById("btn-bypass"),
     btnResetCache: document.getElementById("btn-reset-cache"),
+    srcFileInput: document.getElementById("src-file-input"),
+    fileVcStatus: document.getElementById("file-vc-status"),
+    fileVcOutput: document.getElementById("file-vc-output"),
+    fileVcPlayer: document.getElementById("file-vc-player"),
+    fileVcDownload: document.getElementById("file-vc-download"),
     meterIn: document.getElementById("meter-in"),
     meterOut: document.getElementById("meter-out"),
     canvasWave: document.getElementById("canvas-waveform"),
@@ -416,6 +423,8 @@
       el.btnToggleVc.disabled = false;
       el.btnBypass.disabled = false;
       el.btnResetCache.disabled = false;
+      el.srcFileInput.disabled = false;
+      el.fileVcStatus.textContent = "音声ファイル (.mp3 / .wav 等) を選択して変換";
       el.btnRunBench.disabled = false;
       el.benchStatus.textContent = `${state.backendName} でベンチマーク実行可能です。`;
 
@@ -441,18 +450,132 @@
     return rendered.getChannelData(0);
   }
 
+  async function decodeAudioFileTo24kMono(file) {
+    const arrayBuf = await file.arrayBuffer();
+    const tempCtx = new AudioContext();
+    try {
+      const decoded = await tempCtx.decodeAudioData(arrayBuf);
+      return await resampleTo24kMono(decoded);
+    } finally {
+      await tempCtx.close();
+    }
+  }
+
   async function handleFileUpload(file) {
     if (!file) return;
     try {
-      log(`音声ファイルをデコード中: ${file.name}`);
-      const arrayBuf = await file.arrayBuffer();
-      const tempCtx = new AudioContext();
-      const decoded = await tempCtx.decodeAudioData(arrayBuf);
-      await tempCtx.close();
-      const mono24k = await resampleTo24kMono(decoded);
+      log(`参照音声をデコード中: ${file.name}`);
+      const mono24k = await decodeAudioFileTo24kMono(file);
       await extractSpeakerEmbedding(mono24k, file.name);
     } catch (err) {
       log(`ファイル読込エラー: ${err.message}`);
+    }
+  }
+
+  function encodeWavBlob(samples, sampleRate) {
+    const numSamples = samples.length;
+    const buffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(buffer);
+    const writeStr = (offset, str) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + numSamples * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // Mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, numSamples * 2, true);
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      offset += 2;
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+
+  async function handleSourceFileConvert(file) {
+    if (!file || !state.modelsReady || state.isConvertingFile) return;
+    if (state.isStreaming) {
+      await stopRealtimeVC();
+    }
+
+    state.isConvertingFile = true;
+    el.srcFileInput.disabled = true;
+    el.fileVcStatus.textContent = `変換中: ${file.name}...`;
+
+    try {
+      log(`変換元ファイルをデコード中: ${file.name}`);
+      const mono24k = await decodeAudioFileTo24kMono(file);
+      if (!state.spkEmbData) {
+        await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
+      }
+      state.cacheManager.reset();
+
+      const totalChunks = Math.ceil(mono24k.length / CHUNK_SAMPLES);
+      const outRaw = new Float32Array(totalChunks * CHUNK_SAMPLES);
+      const chunkBuf = new Float32Array(CHUNK_SAMPLES);
+      let inferTotalMs = 0;
+
+      for (let idx = 0; idx < totalChunks; idx++) {
+        const start = idx * CHUNK_SAMPLES;
+        const end = Math.min(mono24k.length, start + CHUNK_SAMPLES);
+        chunkBuf.fill(0);
+        chunkBuf.set(mono24k.subarray(start, end));
+
+        const inputRms = computeRms(chunkBuf);
+        if (state.bypass) {
+          outRaw.set(chunkBuf, start);
+          el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
+          el.meterOut.style.width = `${Math.min(100, inputRms * 350)}%`;
+          drawWaveforms(chunkBuf, chunkBuf);
+        } else {
+          const { outChunk, inferMs } = await runStreamingChunk(chunkBuf);
+          outRaw.set(outChunk, start);
+          inferTotalMs += inferMs;
+          const outRms = computeRms(outChunk);
+          el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
+          el.meterOut.style.width = `${Math.min(100, outRms * 350)}%`;
+          el.perfAvgMs.textContent = `${inferMs.toFixed(2)} ms`;
+          el.perfRtf.textContent = (inferMs / 40.0).toFixed(3);
+          drawWaveforms(chunkBuf, outChunk);
+        }
+        el.fileVcStatus.textContent = `変換中 (${idx + 1}/${totalChunks})...`;
+      }
+
+      // Trim 720-sample causal STFT/OLA synthesis delay so output aligns cleanly
+      const delay = state.bypass ? 0 : Math.min(720, outRaw.length);
+      const trimmed = outRaw.subarray(delay, Math.min(outRaw.length, delay + mono24k.length));
+      const wavBlob = encodeWavBlob(trimmed, SAMPLE_RATE);
+
+      if (state.fileOutputUrl) {
+        URL.revokeObjectURL(state.fileOutputUrl);
+      }
+      state.fileOutputUrl = URL.createObjectURL(wavBlob);
+      el.fileVcPlayer.src = state.fileOutputUrl;
+      el.fileVcDownload.href = state.fileOutputUrl;
+      const baseName = file.name.replace(/\.[^.]+$/, "");
+      el.fileVcDownload.download = `${baseName}_converted.wav`;
+      el.fileVcOutput.hidden = false;
+
+      const avgMs = totalChunks > 0 ? inferTotalMs / totalChunks : 0;
+      const durSec = mono24k.length / SAMPLE_RATE;
+      el.fileVcStatus.textContent = `完了: ${file.name} (${durSec.toFixed(2)}秒 / 平均 ${avgMs.toFixed(1)} ms)`;
+      log(`ファイル変換完了 [${file.name}]: ${totalChunks}チャンク, 平均 ${avgMs.toFixed(2)} ms (RTF ${(avgMs / 40.0).toFixed(3)})`);
+    } catch (err) {
+      el.fileVcStatus.textContent = `変換エラー: ${err.message}`;
+      log(`ファイル変換エラー: ${err.message}`);
+    } finally {
+      state.isConvertingFile = false;
+      el.srcFileInput.disabled = false;
+      el.srcFileInput.value = "";
     }
   }
 
@@ -707,6 +830,11 @@
   el.refFileInput.addEventListener("change", (ev) => {
     const file = ev.target.files && ev.target.files[0];
     if (file) handleFileUpload(file);
+  });
+
+  el.srcFileInput.addEventListener("change", (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (file) handleSourceFileConvert(file);
   });
 
   el.btnRecordRef.addEventListener("click", () => {
