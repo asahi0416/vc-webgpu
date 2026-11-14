@@ -98,10 +98,19 @@ class CausalVocosVocoder(nn.Module):
         # Glottal -12 dB/octave rolloff reduces metallic buzz and improves phase stability
         self.register_buffer("harm_weights", 1.0 / harmonics)
 
-        sample_ramp = (
+        # Schroeder phase offsets prevent coherent zero-phase impulse spikes across harmonics
+        k_idx = torch.arange(1, n_harmonics + 1, dtype=torch.float32)
+        theta_k = (math.pi * k_idx * (k_idx - 1.0) / float(n_harmonics)).view(1, n_harmonics, 1)
+        self.register_buffer("cos_schroeder", torch.cos(theta_k))
+        self.register_buffer("sin_schroeder", torch.sin(theta_k))
+
+        alpha_ramp = (
             torch.arange(1, hop_length + 1, dtype=torch.float32).view(1, 1, 1, hop_length)
-            / float(SAMPLE_RATE)
+            / float(hop_length)
         )
+        self.register_buffer("alpha_ramp", alpha_ramp)
+
+        sample_ramp = alpha_ramp * (float(hop_length) / float(SAMPLE_RATE))
         self.register_buffer("sample_ramp", sample_ramp)
 
         rng = torch.Generator()
@@ -110,6 +119,12 @@ class CausalVocosVocoder(nn.Module):
             float(mel_dim)
         )
         self.register_buffer("noise_basis", noise_basis)
+        # Gentle high-pass noise basis for voiced aspiration with zero chunk-boundary dependency
+        hp_spec = torch.fft.rfft(noise_basis, dim=-1)
+        hp_freqs = torch.linspace(0.0, 1.0, hp_spec.shape[-1], dtype=torch.float32)
+        hp_gain = 0.20 + 0.80 * torch.clamp((hp_freqs - 0.15) / 0.35, 0.0, 1.0)
+        noise_hp_basis = torch.fft.irfft(hp_spec * hp_gain.unsqueeze(0), n=hop_length, dim=-1)
+        self.register_buffer("noise_hp_basis", noise_hp_basis)
 
     @staticmethod
     def _smooth_mel(mel: torch.Tensor) -> torch.Tensor:
@@ -133,14 +148,20 @@ class CausalVocosVocoder(nn.Module):
         stft_exc_cache: torch.Tensor,
         cos_m1_state: torch.Tensor,
         sin_state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate sample-level continuous-phase harmonic+noise excitation and analyze its STFT."""
+        prev_f0_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate sample-level continuous-F0 Schroeder-phase harmonic+noise excitation and analyze its STFT."""
         batch_size, _, t_frames = f0_hz.shape
         cos0 = cos_m1_state + 1.0
         sin0 = sin_state
 
-        # Fractional cycle advance per frame keeps cumsum small and prevents float32 drift
-        d_raw = f0_hz * (float(self.hop_length) / float(SAMPLE_RATE))
+        # Initialize prev_f0 on stream start (when cached state is 0) to exact starting F0 for causal equivalence
+        prev_f0_init = torch.where(prev_f0_state > 1.0, prev_f0_state, f0_hz[:, :, :1])
+        prev_f0_seq = torch.cat([prev_f0_init, f0_hz[:, :, :-1]], dim=-1)
+
+        # Quadratic intra-frame phase sweeps smoothly from prev_f0 to curr f0 with C1 boundary continuity
+        hop_sec = float(self.hop_length) / float(SAMPLE_RATE)
+        d_raw = 0.5 * (prev_f0_seq + f0_hz) * hop_sec
         d_frac = d_raw - torch.floor(d_raw)
         cum_cycles = torch.cumsum(d_frac, dim=-1)
         prev_cycles = torch.cat([cum_cycles[:, :, :1] * 0.0, cum_cycles[:, :, :-1]], dim=-1)
@@ -151,7 +172,10 @@ class CausalVocosVocoder(nn.Module):
         c_start = cos0 * cp - sin0 * sp
         s_start = sin0 * cp + cos0 * sp
 
-        m_rad = (2.0 * math.pi) * (f0_hz.unsqueeze(-1) * self.sample_ramp)
+        m_rad = (2.0 * math.pi * hop_sec) * (
+            prev_f0_seq.unsqueeze(-1) * self.alpha_ramp
+            + 0.5 * (f0_hz - prev_f0_seq).unsqueeze(-1) * (self.alpha_ramp * self.alpha_ramp)
+        )
         cm = torch.cos(m_rad)
         sm = torch.sin(m_rad)
         out_samples = t_frames * self.hop_length
@@ -162,14 +186,17 @@ class CausalVocosVocoder(nn.Module):
             batch_size, 1, out_samples
         )
 
-        # Angle-addition harmonic series k = 1..n_harmonics
-        sin_harms = [s1]
+        # Angle-addition harmonic series with Schroeder phase dispersion k = 1..n_harmonics
+        sin_harms = [s1 * self.cos_schroeder[:, 0:1, :] + c1 * self.sin_schroeder[:, 0:1, :]]
         ck, sk = c1, s1
-        for _ in range(2, self.n_harmonics + 1):
+        for k_idx in range(1, self.n_harmonics):
             ck_next = ck * c1 - sk * s1
             sk_next = sk * c1 + ck * s1
             ck, sk = ck_next, sk_next
-            sin_harms.append(sk)
+            sin_harms.append(
+                sk * self.cos_schroeder[:, k_idx : k_idx + 1, :]
+                + ck * self.sin_schroeder[:, k_idx : k_idx + 1, :]
+            )
         sin_bank = torch.cat(sin_harms, dim=1)
 
         f0_samples = (
@@ -178,13 +205,21 @@ class CausalVocosVocoder(nn.Module):
         uv_samples = (
             uv.unsqueeze(-1).expand(batch_size, 1, t_frames, self.hop_length).reshape(batch_size, 1, out_samples)
         )
-        nyq_mask = (self.harmonics * f0_samples < (SAMPLE_RATE * 0.45)).to(f0_hz.dtype)
-        harm_wave = (self.harm_weights * nyq_mask * sin_bank).sum(dim=1, keepdim=True)
+        harm_freq = self.harmonics * f0_samples
+        nyq_mask = (harm_freq < (SAMPLE_RATE * 0.45)).to(f0_hz.dtype)
+        # Taper high harmonics (> 3 kHz) into aspirated noise so upper formants avoid metallic buzz
+        hf_taper = torch.sigmoid((3200.0 - harm_freq) / 700.0)
+        harm_wave = (self.harm_weights * nyq_mask * hf_taper * sin_bank).sum(dim=1, keepdim=True)
         noise_wav = torch.matmul(noise_seed.transpose(1, 2), self.noise_basis).reshape(
             batch_size, 1, out_samples
         )
+        noise_hp = torch.matmul(noise_seed.transpose(1, 2), self.noise_hp_basis).reshape(
+            batch_size, 1, out_samples
+        )
         exc = (
-            uv_samples * harm_wave * 0.08 + (1.0 - 0.75 * uv_samples) * noise_wav * 0.03
+            uv_samples * harm_wave * 0.08
+            + uv_samples * noise_hp * 0.015
+            + (1.0 - 0.85 * uv_samples) * noise_wav * 0.032
         ).squeeze(1)
 
         combined = torch.cat([stft_exc_cache, exc.unsqueeze(1)], dim=-1)
@@ -204,7 +239,8 @@ class CausalVocosVocoder(nn.Module):
         unit_norm = torch.sqrt(c_end * c_end + s_end * s_end + 1e-12)
         next_cos_m1 = (c_end / unit_norm) - 1.0
         next_sin = s_end / unit_norm
-        return exc_norm, cos_exc, sin_exc, next_stft_exc_cache, next_cos_m1, next_sin
+        next_f0 = f0_hz[:, :, -1:]
+        return exc_norm, cos_exc, sin_exc, next_stft_exc_cache, next_cos_m1, next_sin, next_f0
 
     def forward(
         self,
@@ -236,15 +272,17 @@ class CausalVocosVocoder(nn.Module):
         spec_params = self.head(self.out_norm(h))
         raw_env, raw_disp = torch.chunk(spec_params, 2, dim=1)
         delta_env = 1.2 * torch.tanh(raw_env)
-        phase_disp = 0.25 * torch.tanh(raw_disp)
+        # Shield low harmonic phase (< 1.2 kHz) from learned dispersion to prevent rough buzz
+        hf_phase_mask = torch.clamp((self.fft_freqs - 1200.0) / 1500.0, 0.0, 1.0)
+        phase_disp = 0.25 * torch.tanh(raw_disp) * hf_phase_mask
 
-        mel_smooth = self._smooth_mel(mel)
-        base_log_env = torch.matmul(self.mel_lifter, mel_smooth - self.log_fb_sum)
+        base_log_env = torch.matmul(self.mel_lifter, mel - self.log_fb_sum)
 
         state_slot = vocoder_cache_in[self.active_layers]
         stft_exc_cache = state_slot[:, : self.exc_slots, :].reshape(batch_size, 1, self.cache_len)
         cos_m1_state = state_slot[:, self.exc_slots : self.exc_slots + 1, 0:1]
         sin_state = state_slot[:, self.exc_slots : self.exc_slots + 1, 1:2]
+        prev_f0_state = state_slot[:, self.exc_slots : self.exc_slots + 1, 2:3]
 
         (
             exc_norm,
@@ -253,8 +291,9 @@ class CausalVocosVocoder(nn.Module):
             next_exc_cache,
             next_cos_m1,
             next_sin,
+            next_f0,
         ) = self._synthesize_excitation_spectrum(
-            f0_hz, uv, noise_seed, stft_exc_cache, cos_m1_state, sin_state
+            f0_hz, uv, noise_seed, stft_exc_cache, cos_m1_state, sin_state, prev_f0_state
         )
 
         cos_d = torch.cos(phase_disp)
@@ -277,7 +316,7 @@ class CausalVocosVocoder(nn.Module):
 
         slot_exc = next_exc_cache.reshape(batch_size, self.exc_slots, self.pad_len)
         slot_phase = torch.cat(
-            [next_cos_m1, next_sin, state_slot[:, self.exc_slots : self.exc_slots + 1, 2:] * 0.0],
+            [next_cos_m1, next_sin, next_f0, state_slot[:, self.exc_slots : self.exc_slots + 1, 3:] * 0.0],
             dim=-1,
         )
         slot_tail = state_slot[:, self.exc_slots + 1 :, :] * 0.0

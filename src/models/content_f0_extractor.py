@@ -194,8 +194,9 @@ class CausalPitchConditioner(nn.Module):
         comb_log_f0 = (comb_probs * self.log_f0_cands).sum(dim=1, keepdim=True)
         max_sal, _ = sal.max(dim=1, keepdim=True)
         low_band_energy = mag[:, 2:60, :].mean(dim=1, keepdim=True)
-        comb_uv = torch.sigmoid((max_sal - 0.75) * 6.0) * torch.sigmoid(
-            (low_band_energy - 0.25) * 20.0
+        # Scale-tolerant voicing gate so quiet mic levels stay voiced while mid-vowel harmonics hold
+        comb_uv = torch.sigmoid((max_sal - 0.42) * 8.0) * torch.sigmoid(
+            (low_band_energy - 0.025) * 80.0
         )
         comb_log_norm = (comb_log_f0 - math.log(180.0)) * comb_uv
 
@@ -211,8 +212,9 @@ class CausalPitchConditioner(nn.Module):
         pred = self.f0_head(h)  # (B, 3, T)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
         comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
-        src_log_f0 = src_base_log_f0 + 0.85 * comb_dev + 0.15 * torch.tanh(pred[:, 0:1, :])
-        uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 1.0)
+        # Balance raw harmonic comb with causal ConvNeXt temporal estimate to curb frame F0 jitter
+        src_log_f0 = src_base_log_f0 + 0.55 * comb_dev + 0.45 * (0.55 * torch.tanh(pred[:, 0:1, :]))
+        uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 0.5)
 
         if spk_emb is not None:
             ref_log_f0 = (

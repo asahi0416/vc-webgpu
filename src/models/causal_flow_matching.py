@@ -68,30 +68,16 @@ class CausalFlowMatchingDecoder(nn.Module):
         spk_emb: torch.Tensor,
         vtl_shift: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build causal zero-shot VTL-warped formant + speaker EQ target anchor mel spectrogram."""
+        """Build causal zero-shot speaker-neutral VTL-warped formant + target speaker EQ anchor mel."""
         tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 24.0).unsqueeze(-1)
         tgt_broad = torch.matmul(self.mel_env_mat, tgt_shape_raw)
         tgt_shape = tgt_broad - tgt_broad.mean(dim=1, keepdim=True)
 
-        pad5 = torch.cat(
-            [
-                src_mel[:, :1, :],
-                src_mel[:, :1, :],
-                src_mel,
-                src_mel[:, -1:, :],
-                src_mel[:, -1:, :],
-            ],
-            dim=1,
-        )
-        sm5 = (
-            pad5[:, :-4, :]
-            + pad5[:, 1:-3, :]
-            + pad5[:, 2:-2, :]
-            + pad5[:, 3:-1, :]
-            + pad5[:, 4:, :]
-        ) * 0.2
+        # Light 3-bin smooth suppresses harmonic comb ripple while keeping crisp vowel formants
+        pad3 = torch.cat([src_mel[:, :1, :], src_mel, src_mel[:, -1:, :]], dim=1)
+        sm3 = (pad3[:, :-2, :] + pad3[:, 1:-1, :] + pad3[:, 2:, :]) * (1.0 / 3.0)
         src_frame_mean = src_mel.mean(dim=1, keepdim=True)
-        src_formant = sm5 - src_frame_mean
+        src_formant = sm3 - src_frame_mean
 
         if vtl_shift is None:
             vtl_shift = spk_emb[:, self.mel_dim : self.mel_dim + 1].unsqueeze(-1) / 0.25
@@ -102,13 +88,14 @@ class CausalFlowMatchingDecoder(nn.Module):
         w_formant = (all_warped * warp_w.unsqueeze(2)).sum(dim=1)
         w_formant = w_formant - w_formant.mean(dim=1, keepdim=True)
 
-        src_expected = self.canon_tilt + 0.55 * torch.clamp(vtl_shift, -0.8, 0.8) * self.freq_slope
-        src_expected = src_expected - src_expected.mean(dim=1, keepdim=True)
-        eq_diff = torch.clamp(tgt_shape - src_expected, -1.8, 1.8)
+        # Strip source speaker's broad spectral tilt so Flow starts near target envelope without source leakage
+        w_broad = torch.matmul(self.mel_env_mat, w_formant)
+        w_broad = w_broad - w_broad.mean(dim=1, keepdim=True)
+        w_detail = w_formant - w_broad
 
         voice_gate = torch.sigmoid((src_frame_mean + 8.0) * 2.0)
         norm_frame_mean = -4.5 + 3.2 * torch.tanh((src_frame_mean + 4.5) / 3.2)
-        return norm_frame_mean + w_formant + voice_gate * eq_diff
+        return norm_frame_mean + 0.45 * w_detail + voice_gate * tgt_shape
 
     def forward_velocity(
         self,

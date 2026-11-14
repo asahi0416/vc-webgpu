@@ -16,8 +16,8 @@ from src.models.audio_dsp import HOP_LENGTH, SAMPLE_RATE
 
 def apply_mel_formant_perturbation(
     log_mel: torch.Tensor,
-    warp_range: Tuple[float, float] = (0.75, 1.25),
-    tilt_strength: float = 0.6,
+    warp_range: Tuple[float, float] = (0.70, 1.32),
+    tilt_strength: float = 0.9,
 ) -> torch.Tensor:
     """Perturb source log-mel along the frequency axis to strip speaker timbre.
 
