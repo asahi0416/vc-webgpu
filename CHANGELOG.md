@@ -22,3 +22,6 @@
 - Common Voice擬似話者データ追加と追加学習
   - 内容: src/prepare_common_voice.py を追加（話者埋め込みで擬似話者分割、TransactionalBackup保護）、data/mixed（64話者969本）で20エポック学習（総損失 5.63→4.02）、ONNX更新
   - 理由: 4話者のみでは話者の多様性が不足し、ゼロショット汎化が見込めないため
+- 追加学習（大規模化）: Common Voice 8シャード＋JVNV 232話者で20エポック再開学習
+  - 内容: `data/mixed` を232話者（JVNV 4話者＋CV擬似228話者・2,588 WAV）へ拡張して Epoch 46→65 の20エポック学習を実行（`total_loss` 4.1324→3.2952、`mel_l1` 0.8431→0.6357、`spk_loss` 0.0614→0.0320、`vocoder_loss` 1.7974→1.4975）、`checkpoints/vc_latest.pt` と `models/*.onnx` を更新（一時ログ `prep.log` / `train_big.log` を整理）
+  - 理由: さらに多様な話者分布でゼロショット話者類似度と再構成品質を向上させるため
