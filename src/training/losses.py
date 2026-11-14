@@ -1,12 +1,13 @@
 """Training losses and pure-PyTorch causal F0 ground-truth extractor."""
 
+import math
 from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.audio_dsp import HOP_LENGTH, N_FFT, SAMPLE_RATE
+from src.models.audio_dsp import HOP_LENGTH, N_FFT, SAMPLE_RATE, build_harmonic_comb_bank
 
 
 @torch.no_grad()
@@ -16,11 +17,11 @@ def extract_f0_autocorr(
     n_fft: int = N_FFT,
     hop_length: int = HOP_LENGTH,
     f0_min: float = 65.0,
-    f0_max: float = 500.0,
+    f0_max: float = 360.0,
     voicing_thresh: float = 0.50,
     rms_thresh: float = 1e-3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract frame-wise ground-truth F0 (Hz) and voiced flag using low-pass NSDF autocorrelation."""
+    """Extract frame-wise ground-truth F0 (Hz) and voiced flag using comb-guided low-pass NSDF."""
     pad_left = n_fft - hop_length
     padded = F.pad(audio, (pad_left, 0))
     frames = padded.unfold(dimension=-1, size=n_fft, step=hop_length)  # (B, T_frames, N)
@@ -29,7 +30,7 @@ def extract_f0_autocorr(
     rms = torch.sqrt(torch.mean(frames * frames, dim=-1) + 1e-12)  # (B, T_frames)
     centered = frames - frames.mean(dim=-1, keepdim=True)
 
-    # Low-pass filter in RFFT domain (keep <= 500Hz intact, taper to 900Hz) to avoid formant octave jumps
+    # Low-pass filter in RFFT domain (keep <= 260Hz intact, taper to 600Hz) to curb formant octave jumps
     fft_size = 1
     while fft_size < 2 * win_len:
         fft_size *= 2
@@ -37,7 +38,7 @@ def extract_f0_autocorr(
     freqs = torch.linspace(
         0.0, float(sample_rate) / 2.0, spec_raw.shape[-1], device=audio.device, dtype=audio.dtype
     )
-    lp_gain = torch.clamp(1.0 - (freqs - 500.0) / 400.0, 0.0, 1.0)
+    lp_gain = torch.clamp(1.0 - (freqs - 260.0) / 340.0, 0.0, 1.0)
     frames_lp = torch.fft.irfft(spec_raw * lp_gain, n=fft_size, dim=-1)[:, :, :win_len]
     frames_lp = frames_lp - frames_lp.mean(dim=-1, keepdim=True)
 
@@ -60,19 +61,43 @@ def extract_f0_autocorr(
     min_lag = max(2, int(float(sample_rate) / f0_max))
     max_lag = min(win_len - 2, int(float(sample_rate) / f0_min))
 
+    # Harmonic comb salience over Hann-windowed magnitude to suppress octave multiples
+    win_hann = torch.hann_window(win_len, periodic=True, device=audio.device, dtype=audio.dtype)
+    mag_spec = torch.fft.rfft(frames * win_hann.view(1, 1, win_len), n=win_len, dim=-1)
+    mag_amp = torch.sqrt(mag_spec.real * mag_spec.real + mag_spec.imag * mag_spec.imag + 1e-9)
+    c_f0_min = 70.0
+    c_f0_max = max(360.0, f0_max)
+    n_cands = 96
+    comb_bank, _ = build_harmonic_comb_bank(
+        sr=sample_rate, n_fft=win_len, n_cands=n_cands, f0_min=c_f0_min, f0_max=c_f0_max
+    )
+    comb_bank = comb_bank.to(device=audio.device, dtype=audio.dtype)
+    comb_sal = torch.matmul(torch.log(mag_amp + 1e-3), comb_bank.t())  # (B, T_frames, n_cands)
+
+    lags = torch.arange(min_lag, max_lag + 1, device=audio.device, dtype=audio.dtype)
+    log_lag_f0 = torch.log(float(sample_rate) / lags)
+    log_c_min = math.log(c_f0_min)
+    log_c_step = (math.log(c_f0_max) - log_c_min) / float(n_cands - 1)
+    c_pos = torch.clamp((log_lag_f0 - log_c_min) / log_c_step, 0.0, float(n_cands - 1))
+    c_i0 = torch.floor(c_pos).to(torch.int64)
+    c_i1 = torch.clamp(c_i0 + 1, max=n_cands - 1)
+    c_frac = (c_pos - c_i0.to(audio.dtype)).view(1, 1, -1)
+    lag_sal = (1.0 - c_frac) * comb_sal[:, :, c_i0] + c_frac * comb_sal[:, :, c_i1]
+
     sub_nsdf = nsdf[:, :, min_lag : max_lag + 1]  # (B, T_frames, L)
-    max_val, _ = sub_nsdf.max(dim=-1, keepdim=True)
+    guided_nsdf = sub_nsdf + 0.22 * torch.clamp(lag_sal, -1.0, 1.5)
+    max_val, _ = guided_nsdf.max(dim=-1, keepdim=True)
 
     # Detect local peaks inside [min_lag+1, max_lag-1]
-    left = sub_nsdf[:, :, :-2]
-    center = sub_nsdf[:, :, 1:-1]
-    right = sub_nsdf[:, :, 2:]
+    left = guided_nsdf[:, :, :-2]
+    center = guided_nsdf[:, :, 1:-1]
+    right = guided_nsdf[:, :, 2:]
     is_peak = (center > left) & (center >= right)
     strong_peak = is_peak & (center >= 0.95 * torch.clamp(max_val, min=0.0))
 
     has_peak = strong_peak.any(dim=-1)
     first_peak_offset = torch.argmax(strong_peak.to(torch.int64), dim=-1)  # index in center (offset +1)
-    raw_argmax = torch.argmax(sub_nsdf, dim=-1)
+    raw_argmax = torch.argmax(guided_nsdf, dim=-1)
 
     best_rel_idx = torch.where(has_peak, first_peak_offset + 1, raw_argmax)
     best_lag = best_rel_idx + min_lag  # (B, T_frames)

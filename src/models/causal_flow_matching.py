@@ -1,12 +1,12 @@
 """Causal Rectified Flow & Consistency Flow Matching Decoder."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.audio_dsp import N_MELS
+from src.models.audio_dsp import N_MELS, build_mel_envelope_and_vtl_banks
 from src.models.causal_blocks import (
     CausalConvNeXtBlock,
     ChannelLayerNorm,
@@ -48,7 +48,47 @@ class CausalFlowMatchingDecoder(nn.Module):
         )
         self.out_norm = ChannelLayerNorm(dim)
         self.out_proj = nn.Conv1d(dim, mel_dim, kernel_size=1)
-        nn.init.constant_(self.out_proj.bias, -5.5)
+
+        mel_env_mat, vtl_warp_bank = build_mel_envelope_and_vtl_banks(n_mels=mel_dim)
+        self.register_buffer("mel_env_mat", mel_env_mat)
+        self.register_buffer("vtl_warp_bank", vtl_warp_bank)
+        self.register_buffer(
+            "warp_indices",
+            torch.arange(vtl_warp_bank.shape[1], dtype=torch.float32).view(1, -1, 1),
+        )
+
+    def compute_target_base_mel(
+        self,
+        src_mel: torch.Tensor,
+        spk_emb: torch.Tensor,
+        vtl_shift: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build causal zero-shot target envelope + VTL-shifted formant anchor mel spectrogram."""
+        tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 24.0).unsqueeze(-1)
+        tgt_broad = torch.matmul(self.mel_env_mat, tgt_shape_raw)
+        tgt_shape = tgt_broad - tgt_broad.mean(dim=1, keepdim=True)
+
+        src_broad = torch.matmul(self.mel_env_mat, src_mel)
+        src_shape = src_broad - src_broad.mean(dim=1, keepdim=True)
+        src_detail = src_mel - src_broad
+
+        if vtl_shift is None:
+            vtl_shift = spk_emb[:, self.mel_dim : self.mel_dim + 1].unsqueeze(-1) / 0.25
+
+        warp_pos = torch.clamp(2.0 + vtl_shift * 3.5, 0.0, 4.0)
+        warp_w = torch.clamp(1.0 - torch.abs(warp_pos - self.warp_indices), min=0.0)
+        all_warped = torch.matmul(self.vtl_warp_bank, src_detail.unsqueeze(1))
+        warped_detail = (all_warped * warp_w.unsqueeze(2)).sum(dim=1)
+
+        src_frame_mean = src_mel.mean(dim=1, keepdim=True)
+        voice_gate = torch.sigmoid((src_frame_mean + 8.8) * 2.0)
+        norm_frame_mean = -6.8 + 1.8 * torch.tanh((src_frame_mean + 6.8) / 1.8)
+        return (
+            norm_frame_mean
+            + voice_gate * tgt_shape
+            + (1.0 - voice_gate) * src_shape
+            + 0.7 * warped_detail
+        )
 
     def forward_velocity(
         self,
@@ -90,23 +130,11 @@ class CausalFlowMatchingDecoder(nn.Module):
         spk_emb: torch.Tensor,
         flow_cache_in: torch.Tensor,
         num_steps: int = 2,
+        base_mel: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run few-step causal Euler ODE integration with per-step state caching.
-
-        Args:
-            x_0: Initial Gaussian noise of shape (B, mel_dim, T).
-            cond_feat: Conditioning features of shape (B, dim, T).
-            spk_emb: Speaker embedding of shape (B, dim).
-            flow_cache_in: Per-step layer caches of shape
-                (num_steps, num_layers, B, dim, pad_len).
-            num_steps: Number of Euler integration steps (typically 1 or 2).
-
-        Returns:
-            x_1: Converted log-mel spectrogram of shape (B, mel_dim, T).
-            flow_cache_out: Updated per-step layer caches of shape
-                (num_steps, num_layers, B, dim, pad_len).
-        """
-        x = x_0
+        """Run few-step causal Euler ODE integration anchored at target spectral envelope."""
+        anchor = base_mel if base_mel is not None else torch.zeros_like(x_0)
+        x = anchor + 0.04 * x_0
         dt = 1.0 / float(num_steps)
         t_template = x_0[:, :1, 0] * 0.0  # (B, 1) zero tensor safe for ONNX tracing
 
@@ -118,6 +146,9 @@ class CausalFlowMatchingDecoder(nn.Module):
             )
             x = x + dt * v_k
             next_step_caches.append(cache_out_k)
+
+        if base_mel is not None:
+            x = anchor + 1.0 * torch.tanh(x - anchor)
 
         flow_cache_out = torch.stack(next_step_caches, dim=0)
         return x, flow_cache_out
@@ -137,10 +168,12 @@ class CausalFlowMatchingDecoder(nn.Module):
         x_1: torch.Tensor,
         cond_feat: torch.Tensor,
         spk_emb: torch.Tensor,
+        base_mel: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute standard Optimal-Transport Rectified Flow matching loss."""
+        """Compute Optimal-Transport Rectified Flow matching loss from base_mel + low noise."""
         batch_size = x_1.shape[0]
-        x_0 = torch.randn_like(x_1)
+        anchor = base_mel if base_mel is not None else torch.zeros_like(x_1)
+        x_0 = anchor + 0.04 * torch.randn_like(x_1)
         t = torch.rand(batch_size, 1, device=x_1.device, dtype=x_1.dtype)
         t_view = t.unsqueeze(-1)
 
@@ -157,10 +190,12 @@ class CausalFlowMatchingDecoder(nn.Module):
         cond_feat: torch.Tensor,
         spk_emb: torch.Tensor,
         delta_t: float = 0.05,
+        base_mel: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute Consistency Flow Matching loss for 1-2 step distillation."""
         batch_size = x_1.shape[0]
-        x_0 = torch.randn_like(x_1)
+        anchor = base_mel if base_mel is not None else torch.zeros_like(x_1)
+        x_0 = anchor + 0.04 * torch.randn_like(x_1)
         t = torch.rand(batch_size, 1, device=x_1.device, dtype=x_1.dtype) * (1.0 - delta_t)
         t_next = t + delta_t
 

@@ -81,6 +81,11 @@ class CausalVocosVocoder(nn.Module):
         freq_mat = freq_mat / freq_mat.sum(dim=-1, keepdim=True)
         self.register_buffer("freq_smooth_mat", freq_mat.unsqueeze(0))
 
+        fft_freqs = torch.linspace(0.0, float(SAMPLE_RATE) / 2.0, self.n_freq_bins).view(
+            1, self.n_freq_bins, 1
+        )
+        self.register_buffer("fft_freqs", fft_freqs)
+
         # Causal STFT kernel for harmonic-plus-noise excitation analysis
         stft_ref = CausalMelSpectrogram(
             sample_rate=SAMPLE_RATE, n_fft=n_fft, hop_length=hop_length, n_mels=mel_dim
@@ -230,7 +235,7 @@ class CausalVocosVocoder(nn.Module):
 
         spec_params = self.head(self.out_norm(h))
         raw_env, raw_disp = torch.chunk(spec_params, 2, dim=1)
-        delta_env = 2.5 * torch.tanh(raw_env)
+        delta_env = 1.2 * torch.tanh(raw_env)
         phase_disp = 0.25 * torch.tanh(raw_disp)
 
         mel_smooth = self._smooth_mel(mel)
@@ -257,7 +262,17 @@ class CausalVocosVocoder(nn.Module):
         cos_p = cos_exc * cos_d - sin_exc * sin_d
         sin_p = sin_exc * cos_d + cos_exc * sin_d
 
-        total_log_mag = base_log_env + delta_env + torch.log(torch.clamp(exc_norm, min=0.04))
+        sub_f0_cut = 4.5 * uv * torch.clamp(
+            1.0 - self.fft_freqs / torch.clamp(0.85 * f0_hz, min=45.0),
+            0.0,
+            1.0,
+        )
+        total_log_mag = (
+            base_log_env
+            + delta_env
+            + torch.log(torch.clamp(exc_norm, min=0.05, max=6.0))
+            - sub_f0_cut
+        )
         audio_out, ola_cache_out = self.istft(total_log_mag, sin_p, cos_p, ola_cache_in)
 
         slot_exc = next_exc_cache.reshape(batch_size, self.exc_slots, self.pad_len)

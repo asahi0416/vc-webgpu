@@ -84,12 +84,22 @@ class StreamingVCCore(nn.Module):
         )
 
         cond_feat = content_feat + f0_feat
+        pc = self.pitch_conditioner
+        vtl_shift = (
+            pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
+            if (pc.last_tgt_base_log_f0 is not None and pc.last_src_base_log_f0 is not None)
+            else None
+        )
+        base_mel = self.flow_decoder.compute_target_base_mel(
+            log_mel, spk_emb, vtl_shift=vtl_shift
+        )
         converted_mel, flow_cache_out = self.flow_decoder.forward_euler_streaming(
             noise_seed,
             cond_feat,
             spk_emb,
             flow_cache_in,
             num_steps=self.num_flow_steps,
+            base_mel=base_mel,
         )
 
         audio_out, vocoder_cache_out, ola_cache_out = self.vocoder(
@@ -199,11 +209,24 @@ class StreamingFlowMatchingVC(nn.Module):
         f0_feat, _, _, _ = pc(src_mag, src_mel, pitch_shift_semitones, pc_cache, spk_emb=spk_emb)
         cond_feat = content_feat + f0_feat
 
+        vtl_shift = (
+            pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
+            if (pc.last_tgt_base_log_f0 is not None and pc.last_src_base_log_f0 is not None)
+            else None
+        )
+        base_mel = self.core.flow_decoder.compute_target_base_mel(
+            src_mel, spk_emb, vtl_shift=vtl_shift
+        )
+
         # Target mel ground truth
         tgt_mel, _, _ = self.core.mel_extractor(target_audio, stft_zero)
 
-        rf_loss = self.core.flow_decoder.compute_rectified_flow_loss(tgt_mel, cond_feat, spk_emb)
-        cm_loss = self.core.flow_decoder.compute_consistency_loss(tgt_mel, cond_feat, spk_emb)
+        rf_loss = self.core.flow_decoder.compute_rectified_flow_loss(
+            tgt_mel, cond_feat, spk_emb, base_mel=base_mel
+        )
+        cm_loss = self.core.flow_decoder.compute_consistency_loss(
+            tgt_mel, cond_feat, spk_emb, base_mel=base_mel
+        )
         total_loss = rf_loss + 0.5 * cm_loss
         return {
             "total_loss": total_loss,

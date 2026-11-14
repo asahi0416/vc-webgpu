@@ -4,6 +4,7 @@ Designed without complex64 tensors or custom operators so that all operations
 export cleanly to ONNX opset 17 and execute efficiently on WebGPU.
 """
 
+import math
 from typing import Tuple
 
 import torch
@@ -239,3 +240,65 @@ class CausalISTFT(nn.Module):
         audio_out = canvas[:, :out_samples]
         ola_cache_out = canvas[:, out_samples:]
         return audio_out, ola_cache_out
+
+
+def build_harmonic_comb_bank(
+    sr: int = SAMPLE_RATE,
+    n_fft: int = N_FFT,
+    n_cands: int = 96,
+    f0_min: float = 70.0,
+    f0_max: float = 360.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build cosine harmonic-comb filterbank (n_cands, n_freqs) and log_f0_cands (1, n_cands, 1)."""
+    n_freqs = n_fft // 2 + 1
+    f0_cands = torch.exp(torch.linspace(math.log(f0_min), math.log(f0_max), n_cands, dtype=torch.float64))
+    log_f0_cands = torch.log(f0_cands).to(torch.float32).view(1, n_cands, 1)
+    freqs = torch.linspace(0.0, float(sr) / 2.0, n_freqs, dtype=torch.float64)
+
+    comb = torch.zeros(n_cands, n_freqs, dtype=torch.float32)
+    for idx, f0 in enumerate(f0_cands):
+        ratio = freqs / f0
+        mask = (ratio >= 0.6) & (ratio <= 6.5)
+        weight = torch.pow(torch.clamp(ratio, min=0.5), -0.6) * mask.to(torch.float64)
+        w_cos = torch.cos(2.0 * math.pi * ratio) * weight
+        pos = torch.clamp(w_cos, min=0.0)
+        neg = torch.clamp(-w_cos, min=0.0)
+        comb[idx] = (pos / (pos.sum() + 1e-6) - neg / (neg.sum() + 1e-6)).to(torch.float32)
+    return comb, log_f0_cands
+
+
+def build_mel_envelope_and_vtl_banks(
+    n_mels: int = N_MELS,
+    smooth_win: int = 15,
+    warp_factors: Tuple[float, ...] = (0.84, 0.92, 1.00, 1.09, 1.18),
+    sr: int = SAMPLE_RATE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build 15-bin mel smoothing matrix (1, M, M) and VTL warp bank (1, K, M, M)."""
+    half_win = smooth_win // 2
+    idx = torch.arange(n_mels)
+    mel_env = ((idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= half_win).to(torch.float32)
+    mel_env = (mel_env / mel_env.sum(dim=-1, keepdim=True)).unsqueeze(0)
+
+    mel_min = _hz_to_mel_slaney(torch.tensor(0.0, dtype=torch.float64))
+    mel_max = _hz_to_mel_slaney(torch.tensor(float(sr) / 2.0, dtype=torch.float64))
+    mel_centers = torch.linspace(mel_min, mel_max, n_mels + 2, dtype=torch.float64)[1:-1]
+    hz_centers = _mel_to_hz_slaney(mel_centers)
+    mel_step = (mel_max - mel_min) / float(n_mels + 1)
+
+    rows = torch.arange(n_mels, dtype=torch.int64)
+    warps = []
+    for alpha in warp_factors:
+        src_hz = hz_centers / float(alpha)
+        src_mel = _hz_to_mel_slaney(src_hz)
+        pos = torch.clamp((src_mel - mel_centers[0]) / mel_step, 0.0, float(n_mels - 1))
+        i0 = torch.floor(pos).to(torch.int64)
+        i1 = torch.clamp(i0 + 1, max=n_mels - 1)
+        frac = (pos - i0.to(torch.float64)).to(torch.float32)
+
+        mat = torch.zeros(n_mels, n_mels, dtype=torch.float32)
+        mat[rows, i0] += 1.0 - frac
+        mat[rows, i1] += frac
+        warps.append(mat)
+
+    vtl_warp_bank = torch.stack(warps, dim=0).unsqueeze(0)
+    return mel_env, vtl_warp_bank

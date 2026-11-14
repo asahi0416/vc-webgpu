@@ -99,13 +99,23 @@ class VCTrainer:
                 utt_ref_mean = log_ref_f0[b][vm_ref].mean()
                 base_terms.append(F.l1_loss(tgt_base[b], utt_ref_mean.expand_as(tgt_base[b])))
         base_f0_loss = torch.stack(base_terms).mean() if base_terms else pred_f0.sum() * 0.0
-        f0_loss = f0_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss
+        if src_base is not None and src_base.shape[-1] > 1:
+            base_smooth_loss = (src_base[:, :, 1:] - src_base[:, :, :-1]).pow(2).mean()
+        else:
+            base_smooth_loss = pred_f0.sum() * 0.0
+        f0_loss = f0_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 2.0 * base_smooth_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
         cond_feat = content_feat + f0_feat
         fd = self.model.core.flow_decoder
-        rf_loss = fd.compute_rectified_flow_loss(tgt_mel, cond_feat, spk_emb)
-        cm_loss = fd.compute_consistency_loss(tgt_mel, cond_feat, spk_emb)
+        vtl_shift = (
+            pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
+            if (pc.last_tgt_base_log_f0 is not None and pc.last_src_base_log_f0 is not None)
+            else None
+        )
+        base_mel = fd.compute_target_base_mel(perturbed_mel, spk_emb, vtl_shift=vtl_shift)
+        rf_loss = fd.compute_rectified_flow_loss(tgt_mel, cond_feat, spk_emb, base_mel=base_mel)
+        cm_loss = fd.compute_consistency_loss(tgt_mel, cond_feat, spk_emb, base_mel=base_mel)
 
         noise = torch.randn_like(tgt_mel)
         flow_cache = torch.zeros(
@@ -122,10 +132,54 @@ class VCTrainer:
             spk_emb,
             flow_cache,
             num_steps=self.model.core.num_flow_steps,
+            base_mel=base_mel,
         )
         mel_l1_loss = F.l1_loss(pred_mel, tgt_mel)
-        pred_spk_emb = self.model.speaker_encoder.encode_mel(pred_mel)
+
+        # Evaluate mel speaker consistency without backprop into SpeakerEncoder parameters
+        spk_params = list(self.model.speaker_encoder.parameters())
+        prev_req_grad = [p.requires_grad for p in spk_params]
+        try:
+            for p in spk_params:
+                p.requires_grad_(False)
+            pred_spk_emb = self.model.speaker_encoder.encode_mel(pred_mel)
+        finally:
+            for p, req in zip(spk_params, prev_req_grad):
+                p.requires_grad_(req)
         mel_spk_loss = (1.0 - (pred_spk_emb * spk_emb.detach()).sum(dim=-1)).mean()
+
+        # Cross-speaker shuffled envelope consistency loss
+        if batch_size > 1:
+            perm_idx = torch.roll(torch.arange(batch_size, device=self.device), shifts=1)
+            spk_shuf = spk_emb[perm_idx].detach()
+            f0_feat_shuf, _, _, _ = pc(
+                tgt_mag, perturbed_mel, pitch_shift, pc_cache, spk_emb=spk_shuf
+            )
+            vtl_shuf = (
+                pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
+                if (pc.last_tgt_base_log_f0 is not None and pc.last_src_base_log_f0 is not None)
+                else None
+            )
+            base_mel_shuf = fd.compute_target_base_mel(
+                perturbed_mel, spk_shuf, vtl_shift=vtl_shuf
+            )
+            pred_mel_shuf, _ = fd.forward_euler_streaming(
+                noise,
+                content_feat + f0_feat_shuf,
+                spk_shuf,
+                flow_cache,
+                num_steps=self.model.core.num_flow_steps,
+                base_mel=base_mel_shuf,
+            )
+            pred_env_shuf = torch.matmul(fd.mel_env_mat, pred_mel_shuf)
+            pred_shape_shuf = pred_env_shuf - pred_env_shuf.mean(dim=1, keepdim=True)
+            tgt_shape_raw = (spk_shuf[:, :N_MELS] * 24.0).unsqueeze(-1)
+            tgt_env_shuf = torch.matmul(fd.mel_env_mat, tgt_shape_raw)
+            tgt_shape_shuf = tgt_env_shuf - tgt_env_shuf.mean(dim=1, keepdim=True)
+            v_gate = (tgt_mel.mean(dim=1, keepdim=True) > -8.8).to(pred_mel_shuf.dtype)
+            cross_env_loss = ((pred_shape_shuf - tgt_shape_shuf).abs() * v_gate).mean()
+        else:
+            cross_env_loss = pred_mel.sum() * 0.0
 
         # 5. Causal NSF Vocos Vocoder loss (aligned by STFT_CACHE_LEN=720 causal synthesis delay)
         voc = self.model.core.vocoder
@@ -173,6 +227,7 @@ class VCTrainer:
             + 1.0 * f0_loss
             + 0.5 * spk_loss
             + 0.5 * mel_spk_loss
+            + 0.5 * cross_env_loss
             + vocoder_loss
         )
 
