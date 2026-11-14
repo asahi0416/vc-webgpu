@@ -16,7 +16,7 @@ def extract_f0_autocorr(
     sample_rate: int = SAMPLE_RATE,
     n_fft: int = N_FFT,
     hop_length: int = HOP_LENGTH,
-    f0_min: float = 65.0,
+    f0_min: float = 75.0,
     f0_max: float = 360.0,
     voicing_thresh: float = 0.55,
     rms_thresh: float = 0.015,
@@ -85,7 +85,7 @@ def extract_f0_autocorr(
     lag_sal = (1.0 - c_frac) * comb_sal[:, :, c_i0] + c_frac * comb_sal[:, :, c_i1]
 
     sub_nsdf = nsdf[:, :, min_lag : max_lag + 1]  # (B, T_frames, L)
-    guided_nsdf = sub_nsdf + 0.22 * torch.clamp(lag_sal, -1.0, 1.5)
+    guided_nsdf = sub_nsdf + 0.30 * torch.clamp(lag_sal, -1.0, 1.5)
     max_val, _ = guided_nsdf.max(dim=-1, keepdim=True)
 
     # Detect local peaks inside [min_lag+1, max_lag-1]
@@ -120,11 +120,22 @@ def extract_f0_autocorr(
     refined_lag = lag_clamped.to(torch.float32) + delta
 
     voiced = (rms > rms_thresh) & (best_corr > voicing_thresh)
-    f0_hz = torch.where(
+    raw_f0_hz = torch.where(
         voiced,
         float(sample_rate) / torch.clamp(refined_lag, min=1.0),
         torch.full_like(refined_lag, 150.0),
     )
+
+    # 5-frame masked log-F0 median filter removes isolated offline octave glitches
+    if t_frames >= 5:
+        log_f0 = torch.log(torch.clamp(raw_f0_hz, min=40.0))
+        wins = F.pad(log_f0, (2, 2), mode="replicate").unfold(-1, 5, 1)
+        win_v = F.pad(voiced.to(torch.float32), (2, 2), mode="replicate").unfold(-1, 5, 1) > 0.5
+        clean_wins = torch.where(win_v, wins, log_f0.unsqueeze(-1).expand_as(wins))
+        med_f0_hz = torch.exp(clean_wins.median(dim=-1).values)
+        f0_hz = torch.where(voiced, med_f0_hz, raw_f0_hz)
+    else:
+        f0_hz = raw_f0_hz
 
     return f0_hz.unsqueeze(1), voiced.to(torch.float32).unsqueeze(1)
 

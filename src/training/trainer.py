@@ -19,11 +19,16 @@ from src.training.losses import (
 )
 
 
-def _hp15_formant_std(mel: torch.Tensor) -> torch.Tensor:
-    """Measure per-frame local 15-bin high-pass spectral formant sharpness."""
+def _hp15_formants(mel: torch.Tensor) -> torch.Tensor:
+    """Extract local 15-bin high-pass spectral formant peaks (B, M, T)."""
     pad15 = F.pad(mel, (0, 0, 7, 7), mode="replicate")
     sm15 = F.avg_pool1d(pad15.transpose(1, 2), 15, stride=1).transpose(1, 2)
-    return (mel - sm15).std(dim=1)
+    return mel - sm15
+
+
+def _hp15_formant_std(mel: torch.Tensor) -> torch.Tensor:
+    """Measure per-frame local 15-bin high-pass spectral formant sharpness."""
+    return _hp15_formants(mel).std(dim=1)
 
 
 @torch.no_grad()
@@ -81,19 +86,24 @@ class VCTrainer:
         speaker_ids = batch["speaker_id"].to(self.device)  # (B,)
         batch_size = audio.shape[0]
 
-        # 1. Speaker embedding & contrastive loss
+        # 1. Speaker embedding & cross-utterance contrastive loss
         spk_emb = self.model.speaker_encoder(ref_audio)
-        spk_loss = self.spk_loss_fn(spk_emb, speaker_ids)
 
         # 2. Target acoustic features & causal ground-truth F0 (plus quiet-to-loud mic gain src)
         stft_zero = torch.zeros(batch_size, 1, STFT_CACHE_LEN, device=self.device)
         tgt_mel, tgt_mag, _ = self.model.core.mel_extractor(audio, stft_zero)
+        spk_tgt_mel = self.model.speaker_encoder.encode_mel(tgt_mel.detach(), tgt_mag.detach())
+        spk_loss = (
+            self.spk_loss_fn(spk_emb, speaker_ids)
+            + 0.5 * self.spk_loss_fn(spk_tgt_mel, speaker_ids)
+            + (1.0 - (spk_emb * spk_tgt_mel).sum(dim=-1)).mean()
+        )
         src_mel, src_mag = _compute_gain_aug_mel(self.model.core.mel_extractor, audio, stft_zero)
         gt_f0, gt_uv = extract_f0_autocorr(audio)
         ref_len = (min(ref_audio.shape[1], SAMPLE_RATE) // HOP_LENGTH) * HOP_LENGTH
         ref_f0, ref_uv = extract_f0_autocorr(ref_audio[:, :ref_len])
 
-        # 3. Information perturbation on source mel -> Content & Pitch estimation (no target leakage)
+        # 3. Perturbation-invariant ContentEncoder & gain-tolerant Pitch estimation
         perturbed_src_mel = apply_mel_formant_perturbation(src_mel.detach())
         base_in_mel = apply_mel_formant_perturbation(tgt_mel.detach())
         ce = self.model.core.content_encoder
@@ -102,6 +112,18 @@ class VCTrainer:
         pc_cache = torch.zeros(pc.num_layers, batch_size, pc.hidden_dim, pc.pad_len, device=self.device)
 
         content_feat, _ = ce(perturbed_src_mel, ce_cache)
+        content_clean, _ = ce(tgt_mel.detach(), ce_cache)
+        content_inv_loss = (1.0 - F.cosine_similarity(content_feat, content_clean, dim=1)).mean()
+        uv_w = gt_uv / (gt_uv.sum(dim=-1, keepdim=True) + 1e-5)
+        c_utt_clean = (content_clean * uv_w).sum(dim=-1)
+        c_utt_pert = (content_feat * uv_w).sum(dim=-1)
+        if batch_size > 1:
+            content_bias_loss = (
+                (c_utt_clean - c_utt_clean.mean(dim=0, keepdim=True).detach()).pow(2).mean()
+                + (c_utt_pert - c_utt_pert.mean(dim=0, keepdim=True).detach()).pow(2).mean()
+            )
+        else:
+            content_bias_loss = content_feat.sum() * 0.0
         pitch_shift = torch.zeros(batch_size, 1, device=self.device)
         f0_feat, pred_f0, pred_uv, _ = pc(
             src_mag, perturbed_src_mel, pitch_shift, pc_cache, spk_emb=spk_emb
@@ -119,10 +141,9 @@ class VCTrainer:
             f0_l1 = pred_f0.sum() * 0.0
         both_voiced = voiced_mask[:, :, 1:] & voiced_mask[:, :, :-1]
         if both_voiced.any():
-            f0_delta_l1 = F.l1_loss(
-                (log_pred_f0[:, :, 1:] - log_pred_f0[:, :, :-1])[both_voiced],
-                (log_gt_f0[:, :, 1:] - log_gt_f0[:, :, :-1])[both_voiced],
-            )
+            pred_d = (log_pred_f0[:, :, 1:] - log_pred_f0[:, :, :-1])[both_voiced]
+            gt_d = (log_gt_f0[:, :, 1:] - log_gt_f0[:, :, :-1])[both_voiced]
+            f0_delta_l1 = F.l1_loss(pred_d, gt_d) + 0.5 * (pred_d - gt_d).pow(2).mean()
         else:
             f0_delta_l1 = pred_f0.sum() * 0.0
         uv_bce = F.binary_cross_entropy(torch.clamp(pred_uv, 1e-4, 1.0 - 1e-4), gt_uv)
@@ -144,7 +165,7 @@ class VCTrainer:
             base_smooth_loss = (src_base[:, :, 1:] - src_base[:, :, :-1]).pow(2).mean()
         else:
             base_smooth_loss = pred_f0.sum() * 0.0
-        f0_loss = f0_l1 + 0.5 * f0_delta_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 12.0 * base_smooth_loss
+        f0_loss = f0_l1 + 0.7 * f0_delta_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 12.0 * base_smooth_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
         cond_feat = content_feat + f0_feat
@@ -175,7 +196,9 @@ class VCTrainer:
             num_steps=self.model.core.num_flow_steps,
             base_mel=base_mel,
         )
-        mel_l1_loss = F.l1_loss(pred_mel, tgt_mel)
+        mel_l1_loss = F.l1_loss(pred_mel, tgt_mel) + 0.5 * F.l1_loss(
+            _hp15_formants(pred_mel), _hp15_formants(tgt_mel).detach()
+        )
 
         # Cross-speaker shuffled neural speaker similarity + content consistency + envelope loss
         neural_start = N_MELS + 1
@@ -263,7 +286,7 @@ class VCTrainer:
         voc_cache = torch.zeros(voc.num_layers, batch_size, voc.dim, voc.pad_len, device=self.device)
         ola_cache = torch.zeros(batch_size, STFT_CACHE_LEN, device=self.device)
 
-        voc_in_mel = 0.5 * tgt_mel.detach() + 0.5 * pred_mel.detach()
+        voc_in_mel = 0.3 * tgt_mel.detach() + 0.7 * pred_mel.detach()
         pred_audio, _, _ = voc(
             voc_in_mel,
             spk_emb,
@@ -301,6 +324,8 @@ class VCTrainer:
             rf_loss
             + 0.5 * cm_loss
             + 0.5 * mel_l1_loss
+            + 0.6 * content_inv_loss
+            + 0.8 * content_bias_loss
             + 1.0 * f0_loss
             + 0.5 * spk_loss
             + 0.5 * mel_spk_loss

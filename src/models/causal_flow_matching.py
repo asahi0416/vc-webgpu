@@ -82,7 +82,7 @@ class CausalFlowMatchingDecoder(nn.Module):
         if vtl_shift is None:
             vtl_shift = spk_emb[:, self.mel_dim : self.mel_dim + 1].unsqueeze(-1) / 0.25
 
-        warp_pos = torch.clamp(2.0 + vtl_shift * 3.0, 0.0, 4.0)
+        warp_pos = torch.clamp(2.0 + vtl_shift * 3.8, 0.0, 4.0)
         warp_w = torch.clamp(1.0 - torch.abs(warp_pos - self.warp_indices), min=0.0)
         all_warped = torch.matmul(self.vtl_warp_bank, src_formant.unsqueeze(1))
         w_formant = (all_warped * warp_w.unsqueeze(2)).sum(dim=1)
@@ -93,9 +93,9 @@ class CausalFlowMatchingDecoder(nn.Module):
         w_broad = w_broad - w_broad.mean(dim=1, keepdim=True)
         w_detail = w_formant - w_broad
 
-        voice_gate = torch.sigmoid((src_frame_mean + 8.0) * 2.0)
-        norm_frame_mean = -4.5 + 3.2 * torch.tanh((src_frame_mean + 4.5) / 3.2)
-        return norm_frame_mean + 0.45 * w_detail + voice_gate * tgt_shape
+        voice_gate = torch.sigmoid((src_frame_mean + 8.3) * 2.0)
+        norm_frame_mean = -4.2 + 2.6 * torch.tanh((src_frame_mean + 5.0) / 2.6)
+        return norm_frame_mean + 0.35 * w_detail + voice_gate * tgt_shape
 
     def forward_velocity(
         self,

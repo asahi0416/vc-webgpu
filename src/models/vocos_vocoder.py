@@ -14,6 +14,7 @@ from src.models.audio_dsp import (
     N_FFT,
     N_MELS,
     SAMPLE_RATE,
+    build_cepstral_min_phase_matrix,
     build_mel_filterbank,
 )
 from src.models.causal_blocks import CausalConvNeXtBlock, ChannelLayerNorm
@@ -85,6 +86,8 @@ class CausalVocosVocoder(nn.Module):
             1, self.n_freq_bins, 1
         )
         self.register_buffer("fft_freqs", fft_freqs)
+        # Exact linear causal minimum-phase Hilbert operator over filter log-magnitude
+        self.register_buffer("min_phase_mat", build_cepstral_min_phase_matrix(n_fft=n_fft))
 
         # Causal STFT kernel for harmonic-plus-noise excitation analysis
         stft_ref = CausalMelSpectrogram(
@@ -272,11 +275,11 @@ class CausalVocosVocoder(nn.Module):
         spec_params = self.head(self.out_norm(h))
         raw_env, raw_disp = torch.chunk(spec_params, 2, dim=1)
         delta_env = 1.2 * torch.tanh(raw_env)
-        # Shield low harmonic phase (< 1.2 kHz) from learned dispersion to prevent rough buzz
-        hf_phase_mask = torch.clamp((self.fft_freqs - 1200.0) / 1500.0, 0.0, 1.0)
-        phase_disp = 0.25 * torch.tanh(raw_disp) * hf_phase_mask
-
         base_log_env = torch.matmul(self.mel_lifter, mel - self.log_fb_sum)
+        filt_log_mag = base_log_env + delta_env
+        # Physical causal minimum-phase vocal tract response eliminates random frame-to-frame phasiness
+        hf_phase_mask = torch.clamp((self.fft_freqs - 1200.0) / 1500.0, 0.0, 1.0)
+        phase_disp = torch.matmul(self.min_phase_mat, filt_log_mag) + 0.05 * torch.tanh(raw_disp) * hf_phase_mask
 
         state_slot = vocoder_cache_in[self.active_layers]
         stft_exc_cache = state_slot[:, : self.exc_slots, :].reshape(batch_size, 1, self.cache_len)

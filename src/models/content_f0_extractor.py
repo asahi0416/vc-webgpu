@@ -18,6 +18,19 @@ from src.models.audio_dsp import (
 from src.models.causal_blocks import CausalConvNeXtBlock, ChannelLayerNorm
 
 
+class _TrainingBottleneckNoise(nn.Module):
+    """Inject additive Gaussian noise during training to limit continuous speaker channel capacity."""
+
+    def __init__(self, noise_std: float = 0.25) -> None:
+        super().__init__()
+        self.noise_std = noise_std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.noise_std > 0.0:
+            return x + self.noise_std * torch.randn_like(x)
+        return x
+
+
 class CausalContentEncoder(nn.Module):
     """Extracts speaker-agnostic phonetic content features causally from log-mel."""
 
@@ -50,10 +63,12 @@ class CausalContentEncoder(nn.Module):
             ]
         )
         self.out_norm = ChannelLayerNorm(dim)
-        # Information bottleneck strips residual timbre while preserving linguistic content
+        # Information bottleneck + training noise strips residual timbre while preserving linguistic content
         self.bottleneck = nn.Sequential(
             nn.Conv1d(dim, bottleneck_dim, kernel_size=1),
             nn.Tanh(),
+            ChannelLayerNorm(bottleneck_dim),
+            _TrainingBottleneckNoise(noise_std=0.25),
             nn.Conv1d(bottleneck_dim, dim, kernel_size=1),
         )
 
@@ -201,7 +216,9 @@ class CausalPitchConditioner(nn.Module):
         comb_log_norm = (comb_log_f0 - math.log(180.0)) * comb_uv
 
         low_mag = torch.log(torch.clamp(mag[:, : self.low_freq_bins, :], min=1e-5))
-        x = torch.cat([low_mag, log_mel, comb_log_norm, comb_uv], dim=1)
+        low_mag_norm = low_mag - low_mag.mean(dim=1, keepdim=True)
+        log_mel_norm = log_mel - log_mel.mean(dim=1, keepdim=True)
+        x = torch.cat([low_mag_norm, log_mel_norm, comb_log_norm, comb_uv], dim=1)
         h = self.in_proj(x)
 
         next_caches = []
@@ -212,8 +229,8 @@ class CausalPitchConditioner(nn.Module):
         pred = self.f0_head(h)  # (B, 3, T)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
         comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
-        # Balance raw harmonic comb with causal ConvNeXt temporal estimate to curb frame F0 jitter
-        src_log_f0 = src_base_log_f0 + 0.55 * comb_dev + 0.45 * (0.55 * torch.tanh(pred[:, 0:1, :]))
+        # Favor 13-frame causal ConvNeXt temporal estimate over noisy single-frame comb jitter
+        src_log_f0 = src_base_log_f0 + 0.25 * comb_dev + 0.75 * (0.60 * torch.tanh(pred[:, 0:1, :]))
         uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 0.5)
 
         if spk_emb is not None:

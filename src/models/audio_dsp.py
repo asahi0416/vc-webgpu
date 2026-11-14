@@ -270,7 +270,7 @@ def build_harmonic_comb_bank(
 def build_mel_envelope_and_vtl_banks(
     n_mels: int = N_MELS,
     smooth_win: int = 15,
-    warp_factors: Tuple[float, ...] = (0.84, 0.92, 1.00, 1.09, 1.18),
+    warp_factors: Tuple[float, ...] = (0.76, 0.88, 1.00, 1.14, 1.28),
     sr: int = SAMPLE_RATE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build 15-bin mel smoothing matrix (1, M, M) and VTL warp bank (1, K, M, M)."""
@@ -302,3 +302,16 @@ def build_mel_envelope_and_vtl_banks(
 
     vtl_warp_bank = torch.stack(warps, dim=0).unsqueeze(0)
     return mel_env, vtl_warp_bank
+
+
+def build_cepstral_min_phase_matrix(n_fft: int = N_FFT) -> torch.Tensor:
+    """Build linear matrix mapping log-magnitude spectrum to causal minimum phase (1, F, F)."""
+    n_bins = n_fft // 2 + 1
+    eye = torch.eye(n_bins, dtype=torch.float64)
+    cep = torch.fft.irfft(eye, n=n_fft, dim=1)
+    causal_win = torch.zeros(n_fft, dtype=torch.float64)
+    causal_win[0] = 1.0
+    causal_win[1 : n_fft // 2] = 2.0
+    causal_win[n_fft // 2] = 1.0
+    analytic = torch.fft.rfft(cep * causal_win.unsqueeze(0), n=n_fft, dim=1)
+    return analytic.imag.t().to(torch.float32).unsqueeze(0)
