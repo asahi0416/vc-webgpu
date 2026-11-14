@@ -262,8 +262,8 @@ class CausalVocosVocoder(nn.Module):
         cos_p = cos_exc * cos_d - sin_exc * sin_d
         sin_p = sin_exc * cos_d + cos_exc * sin_d
 
-        sub_f0_cut = 4.5 * uv * torch.clamp(
-            1.0 - self.fft_freqs / torch.clamp(0.85 * f0_hz, min=45.0),
+        sub_f0_cut = 3.5 * uv * torch.clamp(
+            1.0 - self.fft_freqs / torch.clamp(0.70 * f0_hz, min=45.0, max=185.0),
             0.0,
             1.0,
         )

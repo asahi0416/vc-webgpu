@@ -196,8 +196,8 @@ class CausalPitchConditioner(nn.Module):
         comb_log_f0 = (comb_probs * self.log_f0_cands).sum(dim=1, keepdim=True)
         max_sal, _ = sal.max(dim=1, keepdim=True)
         low_band_energy = mag[:, 2:60, :].mean(dim=1, keepdim=True)
-        comb_uv = torch.sigmoid((max_sal - 0.28) * 12.0) * torch.sigmoid(
-            (low_band_energy - 0.06) * 25.0
+        comb_uv = torch.sigmoid((max_sal - 0.75) * 6.0) * torch.sigmoid(
+            (low_band_energy - 0.25) * 20.0
         )
         comb_log_norm = (comb_log_f0 - math.log(180.0)) * comb_uv
 
@@ -211,9 +211,10 @@ class CausalPitchConditioner(nn.Module):
             next_caches.append(c_out)
 
         pred = self.f0_head(h)  # (B, 3, T)
-        src_log_f0 = comb_log_f0 + 0.08 * torch.tanh(pred[:, 0:1, :])
-        uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 2.0)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
+        comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
+        src_log_f0 = src_base_log_f0 + 0.45 * comb_dev + 0.20 * torch.tanh(pred[:, 0:1, :])
+        uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 1.0)
 
         if spk_emb is not None:
             ref_log_f0 = (
@@ -225,8 +226,8 @@ class CausalPitchConditioner(nn.Module):
                 min=self.log_base_min,
                 max=math.log(340.0),
             )
-            prosody = 0.40 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.40)
-            adapted_log_f0 = tgt_base_log_f0 + 0.55 * prosody
+            prosody = 0.35 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.35)
+            adapted_log_f0 = tgt_base_log_f0 + 0.40 * prosody
         else:
             tgt_base_log_f0 = src_base_log_f0
             adapted_log_f0 = src_log_f0

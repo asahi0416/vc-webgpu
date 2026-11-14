@@ -126,8 +126,9 @@ class SpeakerEncoder(nn.Module):
         self, log_mel: torch.Tensor, mag: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Compute L2-normalized speaker embedding encoding voiced envelope, pitch register, and timbre."""
-        frame_mean = log_mel.mean(dim=1, keepdim=True)
-        w_voiced = F.softmax((frame_mean - frame_mean.max(dim=-1, keepdim=True)[0]) * 2.0, dim=-1)
+        low_mel_mean = log_mel[:, 2:30, :].mean(dim=1, keepdim=True)
+        w_raw = torch.sigmoid((low_mel_mean + 5.5) * 2.0)
+        w_voiced = w_raw / (w_raw.sum(dim=-1, keepdim=True) + 1e-6)
         mu_ref = (log_mel * w_voiced).sum(dim=-1)  # (B, n_mels)
         mu_shape = mu_ref - mu_ref.mean(dim=-1, keepdim=True)
         emb_env = torch.clamp(mu_shape / 24.0, -0.25, 0.25)

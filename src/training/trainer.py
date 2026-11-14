@@ -113,7 +113,8 @@ class VCTrainer:
             if (pc.last_tgt_base_log_f0 is not None and pc.last_src_base_log_f0 is not None)
             else None
         )
-        base_mel = fd.compute_target_base_mel(perturbed_mel, spk_emb, vtl_shift=vtl_shift)
+        base_in_mel = 0.7 * tgt_mel.detach() + 0.3 * perturbed_mel
+        base_mel = fd.compute_target_base_mel(base_in_mel, spk_emb, vtl_shift=vtl_shift)
         rf_loss = fd.compute_rectified_flow_loss(tgt_mel, cond_feat, spk_emb, base_mel=base_mel)
         cm_loss = fd.compute_consistency_loss(tgt_mel, cond_feat, spk_emb, base_mel=base_mel)
 
@@ -173,11 +174,14 @@ class VCTrainer:
             )
             pred_env_shuf = torch.matmul(fd.mel_env_mat, pred_mel_shuf)
             pred_shape_shuf = pred_env_shuf - pred_env_shuf.mean(dim=1, keepdim=True)
-            tgt_shape_raw = (spk_shuf[:, :N_MELS] * 24.0).unsqueeze(-1)
+            tgt_shape_raw = (spk_shuf[:, :N_MELS] * 26.0).unsqueeze(-1)
             tgt_env_shuf = torch.matmul(fd.mel_env_mat, tgt_shape_raw)
             tgt_shape_shuf = tgt_env_shuf - tgt_env_shuf.mean(dim=1, keepdim=True)
             v_gate = (tgt_mel.mean(dim=1, keepdim=True) > -8.8).to(pred_mel_shuf.dtype)
-            cross_env_loss = ((pred_shape_shuf - tgt_shape_shuf).abs() * v_gate).mean()
+            cross_env_loss = (
+                ((pred_shape_shuf - tgt_shape_shuf).abs() * v_gate).mean()
+                + 0.5 * F.l1_loss(pred_mel_shuf, base_mel_shuf.detach())
+            )
         else:
             cross_env_loss = pred_mel.sum() * 0.0
 

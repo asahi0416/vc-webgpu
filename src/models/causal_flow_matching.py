@@ -64,9 +64,10 @@ class CausalFlowMatchingDecoder(nn.Module):
         vtl_shift: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Build causal zero-shot target envelope + VTL-shifted formant anchor mel spectrogram."""
-        tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 24.0).unsqueeze(-1)
+        tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 26.0).unsqueeze(-1)
         tgt_broad = torch.matmul(self.mel_env_mat, tgt_shape_raw)
-        tgt_shape = tgt_broad - tgt_broad.mean(dim=1, keepdim=True)
+        tgt_mix = 0.65 * tgt_shape_raw + 0.35 * tgt_broad
+        tgt_shape = tgt_mix - tgt_mix.mean(dim=1, keepdim=True)
 
         src_broad = torch.matmul(self.mel_env_mat, src_mel)
         src_shape = src_broad - src_broad.mean(dim=1, keepdim=True)
@@ -87,7 +88,7 @@ class CausalFlowMatchingDecoder(nn.Module):
             norm_frame_mean
             + voice_gate * tgt_shape
             + (1.0 - voice_gate) * src_shape
-            + 0.7 * warped_detail
+            + 0.55 * warped_detail
         )
 
     def forward_velocity(

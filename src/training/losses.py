@@ -18,8 +18,8 @@ def extract_f0_autocorr(
     hop_length: int = HOP_LENGTH,
     f0_min: float = 65.0,
     f0_max: float = 360.0,
-    voicing_thresh: float = 0.50,
-    rms_thresh: float = 1e-3,
+    voicing_thresh: float = 0.55,
+    rms_thresh: float = 0.015,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Extract frame-wise ground-truth F0 (Hz) and voiced flag using comb-guided low-pass NSDF."""
     pad_left = n_fft - hop_length
