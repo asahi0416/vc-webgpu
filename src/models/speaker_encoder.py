@@ -16,6 +16,7 @@ from src.models.audio_dsp import (
     _hz_to_mel_slaney,
     _mel_to_hz_slaney,
     build_harmonic_comb_bank,
+    build_mel_envelope_and_vtl_banks,
 )
 from src.models.causal_blocks import ChannelLayerNorm
 
@@ -122,6 +123,13 @@ class SpeakerEncoder(nn.Module):
         neural_dim = max(16, spk_dim - self.acoustic_dim)
         self.out_proj = nn.Linear(hidden_dim * 2, neural_dim)
 
+        mel_env_mat, _ = build_mel_envelope_and_vtl_banks(n_mels=n_mels)
+        self.register_buffer("mel_env_mat", mel_env_mat)
+        x_mel = torch.linspace(-1.0, 1.0, n_mels, dtype=torch.float32)
+        canon_tilt = 0.2425 - 2.3392 * x_mel - 0.6541 * (x_mel ** 2) + 1.0055 * (x_mel ** 3)
+        canon_tilt = (canon_tilt - canon_tilt.mean()).unsqueeze(0)
+        self.register_buffer("canon_tilt", canon_tilt)
+
     def encode_mel(
         self, log_mel: torch.Tensor, mag: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -130,8 +138,12 @@ class SpeakerEncoder(nn.Module):
         w_raw = torch.sigmoid((low_mel_mean + 5.5) * 2.0)
         w_voiced = w_raw / (w_raw.sum(dim=-1, keepdim=True) + 1e-6)
         mu_ref = (log_mel * w_voiced).sum(dim=-1)  # (B, n_mels)
-        mu_shape = mu_ref - mu_ref.mean(dim=-1, keepdim=True)
-        emb_env = torch.clamp(mu_shape / 24.0, -0.25, 0.25)
+        mu_smooth = torch.matmul(self.mel_env_mat, mu_ref.unsqueeze(-1)).squeeze(-1)
+        mu_shape = mu_smooth - mu_smooth.mean(dim=-1, keepdim=True)
+        shape_dev = torch.clamp(mu_shape - self.canon_tilt, -0.90, 0.90)
+        safe_shape = self.canon_tilt + shape_dev
+        safe_shape = safe_shape - safe_shape.mean(dim=-1, keepdim=True)
+        emb_env = torch.clamp(safe_shape / 24.0, -0.25, 0.25)
 
         if mag is not None:
             sal = torch.matmul(self.comb_bank, torch.log(torch.clamp(mag, min=1e-3)))

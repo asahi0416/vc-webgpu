@@ -194,7 +194,7 @@ class CausalVocosVocoder(nn.Module):
         imag = spec[:, self.n_freq_bins :, :]
         exc_mag = torch.sqrt(real * real + imag * imag + 1e-9)
         local_env = torch.matmul(self.freq_smooth_mat, exc_mag)
-        exc_norm = torch.clamp(exc_mag / (local_env + 1e-5), min=0.05, max=6.0)
+        exc_norm = torch.clamp(exc_mag / (local_env + 1e-5), min=0.20, max=3.5)
         cos_exc = real / exc_mag
         sin_exc = imag / exc_mag
 
@@ -270,7 +270,7 @@ class CausalVocosVocoder(nn.Module):
         total_log_mag = (
             base_log_env
             + delta_env
-            + torch.log(torch.clamp(exc_norm, min=0.05, max=6.0))
+            + 0.70 * torch.log(torch.clamp(exc_norm, min=0.20, max=3.5))
             - sub_f0_cut
         )
         audio_out, ola_cache_out = self.istft(total_log_mag, sin_p, cos_p, ola_cache_in)

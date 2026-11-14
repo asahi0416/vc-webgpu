@@ -58,7 +58,7 @@ class CausalContentEncoder(nn.Module):
         )
 
     def _normalize_frame_mel(self, log_mel: torch.Tensor) -> torch.Tensor:
-        """Smooth narrowband harmonics, strip 15-bin global spectral tilt, and normalize per frame."""
+        """Smooth narrowband harmonics and normalize per frame while preserving vowel formants."""
         padded = torch.cat(
             [
                 log_mel[:, :1, :],
@@ -76,11 +76,9 @@ class CausalContentEncoder(nn.Module):
             + padded[:, 3:-1, :]
             + padded[:, 4:, :]
         ) * 0.2
-        broad_env = torch.matmul(self.mel_env_mat, smoothed)
-        detail = smoothed - broad_env
-        mean = detail.mean(dim=1, keepdim=True)
-        var = ((detail - mean) ** 2).mean(dim=1, keepdim=True)
-        return (detail - mean) * torch.rsqrt(var + 1e-5)
+        mean = smoothed.mean(dim=1, keepdim=True)
+        var = ((smoothed - mean) ** 2).mean(dim=1, keepdim=True)
+        return (smoothed - mean) * torch.rsqrt(var + 1e-5)
 
     def forward(
         self,
@@ -213,7 +211,7 @@ class CausalPitchConditioner(nn.Module):
         pred = self.f0_head(h)  # (B, 3, T)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
         comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
-        src_log_f0 = src_base_log_f0 + 0.45 * comb_dev + 0.20 * torch.tanh(pred[:, 0:1, :])
+        src_log_f0 = src_base_log_f0 + 0.85 * comb_dev + 0.15 * torch.tanh(pred[:, 0:1, :])
         uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 1.0)
 
         if spk_emb is not None:
@@ -226,8 +224,8 @@ class CausalPitchConditioner(nn.Module):
                 min=self.log_base_min,
                 max=math.log(340.0),
             )
-            prosody = 0.35 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.35)
-            adapted_log_f0 = tgt_base_log_f0 + 0.40 * prosody
+            prosody = 0.45 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.45)
+            adapted_log_f0 = tgt_base_log_f0 + 0.85 * prosody
         else:
             tgt_base_log_f0 = src_base_log_f0
             adapted_log_f0 = src_log_f0

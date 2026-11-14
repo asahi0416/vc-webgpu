@@ -103,7 +103,7 @@ class VCTrainer:
             base_smooth_loss = (src_base[:, :, 1:] - src_base[:, :, :-1]).pow(2).mean()
         else:
             base_smooth_loss = pred_f0.sum() * 0.0
-        f0_loss = f0_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 2.0 * base_smooth_loss
+        f0_loss = f0_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 12.0 * base_smooth_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
         cond_feat = content_feat + f0_feat
@@ -172,15 +172,17 @@ class VCTrainer:
                 num_steps=self.model.core.num_flow_steps,
                 base_mel=base_mel_shuf,
             )
-            pred_env_shuf = torch.matmul(fd.mel_env_mat, pred_mel_shuf)
+            v_w = torch.sigmoid((tgt_mel[:, 2:30, :].mean(dim=1, keepdim=True) + 5.5) * 2.0)
+            v_w = v_w / (v_w.sum(dim=-1, keepdim=True) + 1e-6)
+            pred_utt_mean = (pred_mel_shuf * v_w).sum(dim=-1, keepdim=True)
+            pred_env_shuf = torch.matmul(fd.mel_env_mat, pred_utt_mean)
             pred_shape_shuf = pred_env_shuf - pred_env_shuf.mean(dim=1, keepdim=True)
-            tgt_shape_raw = (spk_shuf[:, :N_MELS] * 26.0).unsqueeze(-1)
+            tgt_shape_raw = (spk_shuf[:, :N_MELS] * 24.0).unsqueeze(-1)
             tgt_env_shuf = torch.matmul(fd.mel_env_mat, tgt_shape_raw)
             tgt_shape_shuf = tgt_env_shuf - tgt_env_shuf.mean(dim=1, keepdim=True)
-            v_gate = (tgt_mel.mean(dim=1, keepdim=True) > -8.8).to(pred_mel_shuf.dtype)
             cross_env_loss = (
-                ((pred_shape_shuf - tgt_shape_shuf).abs() * v_gate).mean()
-                + 0.5 * F.l1_loss(pred_mel_shuf, base_mel_shuf.detach())
+                (pred_shape_shuf - tgt_shape_shuf).abs().mean()
+                + 0.8 * F.l1_loss(pred_mel_shuf, base_mel_shuf.detach())
             )
         else:
             cross_env_loss = pred_mel.sum() * 0.0

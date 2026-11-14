@@ -56,6 +56,11 @@ class CausalFlowMatchingDecoder(nn.Module):
             "warp_indices",
             torch.arange(vtl_warp_bank.shape[1], dtype=torch.float32).view(1, -1, 1),
         )
+        x_mel = torch.linspace(-1.0, 1.0, mel_dim, dtype=torch.float32)
+        canon_tilt = 0.2425 - 2.3392 * x_mel - 0.6541 * (x_mel ** 2) + 1.0055 * (x_mel ** 3)
+        canon_tilt = (canon_tilt - canon_tilt.mean()).view(1, mel_dim, 1)
+        self.register_buffer("canon_tilt", canon_tilt)
+        self.register_buffer("freq_slope", (-x_mel).view(1, mel_dim, 1))
 
     def compute_target_base_mel(
         self,
@@ -63,33 +68,47 @@ class CausalFlowMatchingDecoder(nn.Module):
         spk_emb: torch.Tensor,
         vtl_shift: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build causal zero-shot target envelope + VTL-shifted formant anchor mel spectrogram."""
-        tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 26.0).unsqueeze(-1)
+        """Build causal zero-shot VTL-warped formant + speaker EQ target anchor mel spectrogram."""
+        tgt_shape_raw = (spk_emb[:, : self.mel_dim] * 24.0).unsqueeze(-1)
         tgt_broad = torch.matmul(self.mel_env_mat, tgt_shape_raw)
-        tgt_mix = 0.65 * tgt_shape_raw + 0.35 * tgt_broad
-        tgt_shape = tgt_mix - tgt_mix.mean(dim=1, keepdim=True)
+        tgt_shape = tgt_broad - tgt_broad.mean(dim=1, keepdim=True)
 
-        src_broad = torch.matmul(self.mel_env_mat, src_mel)
-        src_shape = src_broad - src_broad.mean(dim=1, keepdim=True)
-        src_detail = src_mel - src_broad
+        pad5 = torch.cat(
+            [
+                src_mel[:, :1, :],
+                src_mel[:, :1, :],
+                src_mel,
+                src_mel[:, -1:, :],
+                src_mel[:, -1:, :],
+            ],
+            dim=1,
+        )
+        sm5 = (
+            pad5[:, :-4, :]
+            + pad5[:, 1:-3, :]
+            + pad5[:, 2:-2, :]
+            + pad5[:, 3:-1, :]
+            + pad5[:, 4:, :]
+        ) * 0.2
+        src_frame_mean = src_mel.mean(dim=1, keepdim=True)
+        src_formant = sm5 - src_frame_mean
 
         if vtl_shift is None:
             vtl_shift = spk_emb[:, self.mel_dim : self.mel_dim + 1].unsqueeze(-1) / 0.25
 
-        warp_pos = torch.clamp(2.0 + vtl_shift * 3.5, 0.0, 4.0)
+        warp_pos = torch.clamp(2.0 + vtl_shift * 3.0, 0.0, 4.0)
         warp_w = torch.clamp(1.0 - torch.abs(warp_pos - self.warp_indices), min=0.0)
-        all_warped = torch.matmul(self.vtl_warp_bank, src_detail.unsqueeze(1))
-        warped_detail = (all_warped * warp_w.unsqueeze(2)).sum(dim=1)
+        all_warped = torch.matmul(self.vtl_warp_bank, src_formant.unsqueeze(1))
+        w_formant = (all_warped * warp_w.unsqueeze(2)).sum(dim=1)
+        w_formant = w_formant - w_formant.mean(dim=1, keepdim=True)
 
-        src_frame_mean = src_mel.mean(dim=1, keepdim=True)
-        voice_gate = torch.sigmoid((src_frame_mean + 8.8) * 2.0)
-        norm_frame_mean = -6.8 + 1.8 * torch.tanh((src_frame_mean + 6.8) / 1.8)
-        return (
-            norm_frame_mean
-            + voice_gate * tgt_shape
-            + (1.0 - voice_gate) * src_shape
-            + 0.55 * warped_detail
-        )
+        src_expected = self.canon_tilt + 0.55 * torch.clamp(vtl_shift, -0.8, 0.8) * self.freq_slope
+        src_expected = src_expected - src_expected.mean(dim=1, keepdim=True)
+        eq_diff = torch.clamp(tgt_shape - src_expected, -1.8, 1.8)
+
+        voice_gate = torch.sigmoid((src_frame_mean + 8.0) * 2.0)
+        norm_frame_mean = -4.5 + 3.2 * torch.tanh((src_frame_mean + 4.5) / 3.2)
+        return norm_frame_mean + w_formant + voice_gate * eq_diff
 
     def forward_velocity(
         self,
@@ -149,7 +168,7 @@ class CausalFlowMatchingDecoder(nn.Module):
             next_step_caches.append(cache_out_k)
 
         if base_mel is not None:
-            x = anchor + 1.0 * torch.tanh(x - anchor)
+            x = anchor + 0.80 * torch.tanh((x - anchor) / 0.80)
 
         flow_cache_out = torch.stack(next_step_caches, dim=0)
         return x, flow_cache_out
