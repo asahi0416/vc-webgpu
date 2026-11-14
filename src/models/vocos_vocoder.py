@@ -210,8 +210,8 @@ class CausalVocosVocoder(nn.Module):
         )
         harm_freq = self.harmonics * f0_samples
         nyq_mask = (harm_freq < (SAMPLE_RATE * 0.45)).to(f0_hz.dtype)
-        # Taper high harmonics (> 3 kHz) into aspirated noise so upper formants avoid metallic buzz
-        hf_taper = torch.sigmoid((3200.0 - harm_freq) / 700.0)
+        # Taper high harmonics (> 5.2 kHz) gently into breathiness without turning [2.3k-5.2k] into noise
+        hf_taper = torch.sigmoid((5200.0 - harm_freq) / 900.0)
         harm_wave = (self.harm_weights * nyq_mask * hf_taper * sin_bank).sum(dim=1, keepdim=True)
         noise_wav = torch.matmul(noise_seed.transpose(1, 2), self.noise_basis).reshape(
             batch_size, 1, out_samples
@@ -220,9 +220,9 @@ class CausalVocosVocoder(nn.Module):
             batch_size, 1, out_samples
         )
         exc = (
-            uv_samples * harm_wave * 0.08
-            + uv_samples * noise_hp * 0.015
-            + (1.0 - 0.85 * uv_samples) * noise_wav * 0.032
+            uv_samples * harm_wave * 0.085
+            + uv_samples * noise_hp * 0.005
+            + (1.0 - 0.90 * uv_samples) * noise_wav * 0.032
         ).squeeze(1)
 
         combined = torch.cat([stft_exc_cache, exc.unsqueeze(1)], dim=-1)
@@ -232,7 +232,7 @@ class CausalVocosVocoder(nn.Module):
         imag = spec[:, self.n_freq_bins :, :]
         exc_mag = torch.sqrt(real * real + imag * imag + 1e-9)
         local_env = torch.matmul(self.freq_smooth_mat, exc_mag)
-        exc_norm = torch.clamp(exc_mag / (local_env + 1e-5), min=0.20, max=3.5)
+        exc_norm = torch.clamp(exc_mag / (local_env + 1e-5), min=0.10, max=4.0)
         cos_exc = real / exc_mag
         sin_exc = imag / exc_mag
 
@@ -277,9 +277,9 @@ class CausalVocosVocoder(nn.Module):
         delta_env = 1.2 * torch.tanh(raw_env)
         base_log_env = torch.matmul(self.mel_lifter, mel - self.log_fb_sum)
         filt_log_mag = base_log_env + delta_env
-        # Physical causal minimum-phase vocal tract response eliminates random frame-to-frame phasiness
+        # Keep harmonics clean up to ~5.2 kHz while tapering Nyquist harmonics gently
         hf_phase_mask = torch.clamp((self.fft_freqs - 1200.0) / 1500.0, 0.0, 1.0)
-        phase_disp = torch.matmul(self.min_phase_mat, filt_log_mag) + 0.05 * torch.tanh(raw_disp) * hf_phase_mask
+        phase_disp = torch.matmul(self.min_phase_mat, filt_log_mag) + 0.04 * torch.tanh(raw_disp) * hf_phase_mask
 
         state_slot = vocoder_cache_in[self.active_layers]
         stft_exc_cache = state_slot[:, : self.exc_slots, :].reshape(batch_size, 1, self.cache_len)
@@ -312,7 +312,7 @@ class CausalVocosVocoder(nn.Module):
         total_log_mag = (
             base_log_env
             + delta_env
-            + 0.70 * torch.log(torch.clamp(exc_norm, min=0.20, max=3.5))
+            + 0.85 * torch.log(torch.clamp(exc_norm, min=0.10, max=4.0))
             - sub_f0_cut
         )
         audio_out, ola_cache_out = self.istft(total_log_mag, sin_p, cos_p, ola_cache_in)
