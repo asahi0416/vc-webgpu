@@ -31,3 +31,8 @@
 - ハーモニックコームF0・無音ゲート厳格化・ゼロショット包絡/VTL転写・sub-F0抑制・低ノイズFlow刷新と再学習
   - 内容: `build_harmonic_comb_bank`・`extract_f0_autocorr`（`rms_thresh=0.015`, `voicing_thresh=0.55`）・`CausalPitchConditioner` の無音UVゲート強化と因果F0平滑化、`SpeakerEncoder` への80次元有声包絡・log-F0埋め込み及び低域重み付けプーリング、`CausalFlowMatchingDecoder.compute_target_base_mel`（15ビン包絡＋5タップVTLフォルマントワープ＋AGC＋`0.04*x_0` 低ノイズFlow）、`CausalVocosVocoder` の `sub_f0_cut`、及び `VCTrainer` クロス話者包絡損失を追加し、`data/jvnv` で15エポック学習（`total=5.3325→3.4105`）・ONNX再出力・定量検証・全11テスト合格を確認
   - 理由: ピッチの急激な高低飛び、低音の同時混入、無音ノイズ漏れ、フレーム間ノイズ揺れ、およびゼロショット話者類似度不足を解消するため
+
+## 2026-11-15
+- 動的フォルマント軌跡・自然抑揚・音量AGC・ボコーダコーム自然化と1000ms窓再学習
+  - 内容: `CausalContentEncoder._normalize_frame_mel` と `CausalFlowMatchingDecoder.compute_target_base_mel` で毎フレーム15ビン包絡減算を撤廃して5ビン狭帯域平滑＋全フォルマントVTLワープ＋時間不変EQ差分へ改修、非飽和ラウドネスAGC（`-4.5±3.2`）・`SpeakerEncoder.encode_mel` の `canon_tilt` 残差クランプ（`±0.90`）・`CausalPitchConditioner` の自然抑揚（`0.85x`, `tanh/0.45`）・`CausalVocosVocoder` の柔軟コーム正規化（`clamp[0.20,3.5]`, `0.70` 重み）・`VCTrainer` の発話単位 `cross_env_loss` と `base_smooth_loss=12.0` を実装し、`data/jvnv`（100フレーム=1000ms, batch 4）で15エポック新規学習（`total=4.2143→2.8084`）および ONNX（7.11MB+31.36MB）再出力・定量検証を実施
+  - 理由: 毎フレーム広帯域包絡の定数化による母音・子音フォルマント消失、抑揚圧縮による単調ブザー化、AGC飽和による低音量、および `web/app.js` 内蔵220Hzテスト音声使用時の極端な低域傾斜が引き起こした「完全な機械音」症状を解消するため
