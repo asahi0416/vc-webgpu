@@ -70,8 +70,16 @@ class CausalVocosVocoder(nn.Module):
 
         # Pseudo-inverse mel lifter for smooth spectral envelope initialization
         fb = build_mel_filterbank(sr=SAMPLE_RATE, n_fft=n_fft, n_mels=mel_dim)
+        log_fb_sum = torch.log(torch.clamp(fb.sum(dim=1), min=1e-6)).view(1, mel_dim, 1)
+        self.register_buffer("log_fb_sum", log_fb_sum)
         fb_pinv = fb.T / (fb.T.sum(dim=-1, keepdim=True) + 1e-6)
         self.register_buffer("mel_lifter", fb_pinv.unsqueeze(0))
+
+        # Local frequency envelope smoothing matrix (33 bins ~= 825 Hz) to whiten excitation
+        freq_idx = torch.arange(self.n_freq_bins)
+        freq_mat = ((freq_idx.unsqueeze(0) - freq_idx.unsqueeze(1)).abs() <= 16).to(torch.float32)
+        freq_mat = freq_mat / freq_mat.sum(dim=-1, keepdim=True)
+        self.register_buffer("freq_smooth_mat", freq_mat.unsqueeze(0))
 
         # Causal STFT kernel for harmonic-plus-noise excitation analysis
         stft_ref = CausalMelSpectrogram(
@@ -180,7 +188,8 @@ class CausalVocosVocoder(nn.Module):
         real = spec[:, : self.n_freq_bins, :]
         imag = spec[:, self.n_freq_bins :, :]
         exc_mag = torch.sqrt(real * real + imag * imag + 1e-9)
-        exc_norm = exc_mag / (exc_mag.mean(dim=1, keepdim=True) + 1e-5)
+        local_env = torch.matmul(self.freq_smooth_mat, exc_mag)
+        exc_norm = torch.clamp(exc_mag / (local_env + 1e-5), min=0.05, max=6.0)
         cos_exc = real / exc_mag
         sin_exc = imag / exc_mag
 
@@ -221,11 +230,11 @@ class CausalVocosVocoder(nn.Module):
 
         spec_params = self.head(self.out_norm(h))
         raw_env, raw_disp = torch.chunk(spec_params, 2, dim=1)
-        delta_env = 1.5 * torch.tanh(raw_env)
+        delta_env = 2.5 * torch.tanh(raw_env)
         phase_disp = 0.25 * torch.tanh(raw_disp)
 
         mel_smooth = self._smooth_mel(mel)
-        base_log_env = torch.matmul(self.mel_lifter, mel_smooth)
+        base_log_env = torch.matmul(self.mel_lifter, mel_smooth - self.log_fb_sum)
 
         state_slot = vocoder_cache_in[self.active_layers]
         stft_exc_cache = state_slot[:, : self.exc_slots, :].reshape(batch_size, 1, self.cache_len)

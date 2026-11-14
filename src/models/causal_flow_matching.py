@@ -48,6 +48,7 @@ class CausalFlowMatchingDecoder(nn.Module):
         )
         self.out_norm = ChannelLayerNorm(dim)
         self.out_proj = nn.Conv1d(dim, mel_dim, kernel_size=1)
+        nn.init.constant_(self.out_proj.bias, -5.5)
 
     def forward_velocity(
         self,

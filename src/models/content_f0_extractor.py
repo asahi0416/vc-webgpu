@@ -136,7 +136,12 @@ class CausalPitchConditioner(nn.Module):
             ]
         )
         self.f0_head = nn.Conv1d(hidden_dim, 3, kernel_size=1)
-        self.spk_f0_head = nn.Linear(out_dim, 1)
+        self.spk_f0_head = nn.Sequential(
+            nn.Linear(out_dim, 128),
+            nn.LayerNorm(128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
+        )
 
         # Log-frequency bounds [50 Hz, 1100 Hz]
         self.log_f0_min = math.log(50.0)

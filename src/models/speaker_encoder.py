@@ -93,6 +93,16 @@ class SpeakerEncoder(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_dim * 2)
         self.out_proj = nn.Linear(hidden_dim * 2, spk_dim)
 
+    def encode_mel(self, log_mel: torch.Tensor) -> torch.Tensor:
+        """Compute L2-normalized speaker embedding directly from a log-mel spectrogram."""
+        h = self.in_conv(log_mel)
+        for block in self.blocks:
+            h = block(h)
+
+        stats = self.asp(h)  # (B, 2 * hidden_dim)
+        emb = self.out_proj(self.out_norm(stats))
+        return F.normalize(emb, p=2.0, dim=-1)
+
     def forward(self, ref_audio: torch.Tensor) -> torch.Tensor:
         """Compute L2-normalized speaker embedding from reference waveform.
 
@@ -110,11 +120,4 @@ class SpeakerEncoder(nn.Module):
         # Build zero cache cleanly without dynamic shape ops unfriendly to WebGPU
         stft_cache = audio[:, :1].unsqueeze(1).expand(-1, 1, self.stft_cache_len) * 0.0
         log_mel, _, _ = self.mel_extractor(audio, stft_cache)  # (B, n_mels, T_frames)
-
-        h = self.in_conv(log_mel)
-        for block in self.blocks:
-            h = block(h)
-
-        stats = self.asp(h)  # (B, 2 * hidden_dim)
-        emb = self.out_proj(self.out_norm(stats))
-        return F.normalize(emb, p=2.0, dim=-1)
+        return self.encode_mel(log_mel)

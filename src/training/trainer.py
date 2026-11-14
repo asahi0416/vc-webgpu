@@ -99,7 +99,7 @@ class VCTrainer:
                 utt_ref_mean = log_ref_f0[b][vm_ref].mean()
                 base_terms.append(F.l1_loss(tgt_base[b], utt_ref_mean.expand_as(tgt_base[b])))
         base_f0_loss = torch.stack(base_terms).mean() if base_terms else pred_f0.sum() * 0.0
-        f0_loss = f0_l1 + 0.5 * uv_bce + 0.5 * base_f0_loss
+        f0_loss = f0_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
         cond_feat = content_feat + f0_feat
@@ -124,6 +124,8 @@ class VCTrainer:
             num_steps=self.model.core.num_flow_steps,
         )
         mel_l1_loss = F.l1_loss(pred_mel, tgt_mel)
+        pred_spk_emb = self.model.speaker_encoder.encode_mel(pred_mel)
+        mel_spk_loss = (1.0 - (pred_spk_emb * spk_emb.detach()).sum(dim=-1)).mean()
 
         # 5. Causal NSF Vocos Vocoder loss (aligned by STFT_CACHE_LEN=720 causal synthesis delay)
         voc = self.model.core.vocoder
@@ -168,8 +170,9 @@ class VCTrainer:
             rf_loss
             + 0.5 * cm_loss
             + 0.5 * mel_l1_loss
-            + 0.5 * f0_loss
-            + 0.25 * spk_loss
+            + 1.0 * f0_loss
+            + 0.5 * spk_loss
+            + 0.5 * mel_spk_loss
             + vocoder_loss
         )
 
