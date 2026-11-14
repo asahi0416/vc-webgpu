@@ -39,3 +39,7 @@
 - 話者リーク除去・クロス話者ニューラル話者類似度最適化・低音量UV安定化・Schroeder位相/連続F0ボコーダ改善と再学習
   - 内容: `CausalPitchConditioner` の `comb_uv` 閾値(`max_sal - 0.42`, `low_band_energy - 0.025`)・時間F0平滑比重・UVバイアス見直し、`CausalVocosVocoder` のSchroeder位相分散・キャッシュ内 `prev_f0` を用いたC1連続F0位相補間・3kHz超倍音テーパー＋事前高域強調ノイズ `noise_hp_basis`・`_smooth_mel` 二重ぼかし撤廃、`CausalFlowMatchingDecoder.compute_target_base_mel` の3ビン平滑化と `w_broad` 元話者包絡除去、`VCTrainer` の `0.7*tgt_mel` リーク撤廃・マイク音量ランダム拡張(`0.12〜1.40x`)・クロス話者ニューラル話者類似度損失＋元話者反発項＋内容サイクル損失実装を実施し、`data/jvnv` で15エポック学習（`total=6.0475→3.7751`）・ONNX（`speaker_encoder.onnx` 7.11MB, `streaming_vc_core.onnx` 31.44MB）再出力・全11テスト合格を確認
   - 理由: 「機械的なロボットの声で自分の声に近い気がする」という症状（Flowへのターゲットメル70%混合・元話者包絡残存・無防備なゼロ位相パルス励起・低マイク音量でのUV崩壊）を根本解消するため
+
+## 2026-11-15 (Round 3-4)
+- **ContentEncoder 崩壊解消 & Flow 振幅制限緩和 (`cfa0d5d`)**: `content_inv_loss` を時間平均差し引き後の動的コサイン類似度＋VICReg分散維持ヒンジ (`std >= 0.65`) へ変更、`CausalFlowMatchingDecoder` の `forward_euler_streaming` 残差上限を `0.80 -> 2.80` へ緩和、`SpeakerEncoder` 入力のフレーム平均除去とチャネル拡張＋スタジオ/CVバランス型サンプラーを導入。理由: Round 2 診断で判明した `ContentEncoder` 定数化 (`time_std=0.12`)・Flow 平坦化・JVNV 話者クラスタ崩壊の解消。
+- **Vocoder 高域倍音延長と谷深化 (`345ddec`) + 232話者再学習**: `hf_taper` を `3.2kHz -> 5.2kHz` へ引き上げ、`noise_hp` 低減 (`0.015 -> 0.005`) および `exc_norm` 下限 (`0.20 -> 0.10`)・指数 (`0.70 -> 0.85`) を調整し、`data/mixed` で計 23 エポック学習・ONNX 再出力。理由: ユーザー実音声変換での高域ノイズ感 (`HFflat`) 低減と倍音明瞭度 (`CPP`) 向上。
