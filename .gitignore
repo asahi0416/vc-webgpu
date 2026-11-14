@@ -3,5 +3,6 @@ __pycache__/
 *$py.class
 models/*.onnx
 checkpoints/*.pt
+data/
 .venv/
 venv/

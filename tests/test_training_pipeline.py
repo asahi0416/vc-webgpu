@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.models.audio_dsp import SAMPLE_RATE
 from src.models.streaming_vc_pipeline import StreamingFlowMatchingVC
 from src.training.dataset import SyntheticVocalDataset, WAVVoiceDataset
+from src.training.hf_dataset import TransactionalBackup
 from src.training.losses import extract_f0_autocorr
 from src.training.trainer import VCTrainer
 
@@ -120,6 +121,47 @@ class TestTrainingPipeline(unittest.TestCase):
             onnx_paths = trainer2.export_onnx_models(output_dir=Path(tmpdir) / "onnx")
             self.assertTrue(onnx_paths["speaker_encoder"].exists())
             self.assertTrue(onnx_paths["streaming_vc_core"].exists())
+
+    def test_transactional_backup_rollback(self) -> None:
+        """TransactionalBackup must restore pre-existing targets and remove new outputs on error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            existing_dir = root / "existing_dir"
+            existing_dir.mkdir(parents=True, exist_ok=True)
+            old_file = existing_dir / "old.txt"
+            old_file.write_text("original", encoding="utf-8")
+
+            existing_file = root / "existing_file.bin"
+            existing_file.write_bytes(b"v1")
+
+            new_dir = root / "new_dir"
+            new_ckpt = root / "new_ckpt.pt"
+
+            with self.assertRaises(RuntimeError):
+                with TransactionalBackup([existing_dir, existing_file, new_dir, new_ckpt]):
+                    old_file.write_text("corrupted", encoding="utf-8")
+                    (existing_dir / "extra.txt").write_text("partial", encoding="utf-8")
+                    existing_file.write_bytes(b"v2-partial")
+                    new_dir.mkdir(parents=True, exist_ok=True)
+                    (new_dir / "partial.wav").write_bytes(b"1234")
+                    new_ckpt.write_bytes(b"broken")
+                    raise RuntimeError("simulated pipeline failure")
+
+            self.assertEqual(old_file.read_text(encoding="utf-8"), "original")
+            self.assertFalse((existing_dir / "extra.txt").exists())
+            self.assertEqual(existing_file.read_bytes(), b"v1")
+            self.assertFalse(new_dir.exists())
+            self.assertFalse(new_ckpt.exists())
+
+            # Successful transaction preserves mutations
+            with TransactionalBackup([existing_dir, existing_file, new_dir, new_ckpt]):
+                existing_file.write_bytes(b"v2-committed")
+                new_dir.mkdir(parents=True, exist_ok=True)
+                new_ckpt.write_bytes(b"committed")
+
+            self.assertEqual(existing_file.read_bytes(), b"v2-committed")
+            self.assertTrue(new_dir.exists())
+            self.assertEqual(new_ckpt.read_bytes(), b"committed")
 
 
 if __name__ == "__main__":

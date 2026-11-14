@@ -14,6 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.models.streaming_vc_pipeline import StreamingFlowMatchingVC
 from src.training.dataset import SyntheticVocalDataset, WAVVoiceDataset
+from src.training.hf_dataset import (
+    DEFAULT_HF_REPO,
+    TransactionalBackup,
+    fetch_and_prepare_hf_dataset,
+)
 from src.training.trainer import VCTrainer
 
 
@@ -70,6 +75,35 @@ def main() -> None:
         default="auto",
         help="Device to train on ('auto', 'cuda', or 'cpu')",
     )
+    parser.add_argument(
+        "--auto-hf",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-download and preprocess Japanese speech from Hugging Face Hub if --data-dir is omitted",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=DEFAULT_HF_REPO,
+        help="Hugging Face dataset repository ID",
+    )
+    parser.add_argument(
+        "--samples-per-speaker",
+        type=int,
+        default=6,
+        help="Number of WAV samples per speaker to prepare from Hugging Face",
+    )
+    parser.add_argument(
+        "--hf-data-dir",
+        type=str,
+        default=str(PROJECT_ROOT / "data" / "jvnv"),
+        help="Directory for prepared Hugging Face WAV dataset",
+    )
+    parser.add_argument(
+        "--synthetic-only",
+        action="store_true",
+        help="Force synthetic warmstart dataset instead of Hugging Face real speech",
+    )
     args = parser.parse_args()
 
     device = (
@@ -78,21 +112,51 @@ def main() -> None:
         else args.device
     )
 
+    use_auto_hf = (not args.data_dir) and (not args.synthetic_only) and args.auto_hf
+    backup_targets = [Path(args.save_path)]
+    if use_auto_hf:
+        backup_targets.insert(0, Path(args.hf_data_dir))
+    if args.export_onnx:
+        onnx_dir = Path(args.onnx_dir)
+        backup_targets.extend(
+            [onnx_dir / "speaker_encoder.onnx", onnx_dir / "streaming_vc_core.onnx"]
+        )
+
+    with TransactionalBackup(backup_targets):
+        dataset = _build_dataset(args, use_auto_hf=use_auto_hf)
+        _run_training(args, dataset=dataset, device=device)
+
+
+def _build_dataset(args: argparse.Namespace, use_auto_hf: bool):
     if args.data_dir:
         print(f"[Train] Loading WAV dataset from: {args.data_dir}")
-        dataset = WAVVoiceDataset(
+        return WAVVoiceDataset(
             data_dir=args.data_dir,
             segment_frames=args.segment_frames,
         )
-    else:
-        num_synth = max(40, (args.steps_per_epoch or 20) * args.batch_size)
-        print(f"[Train] Running synthetic multi-speaker warmstart ({num_synth} samples)")
-        dataset = SyntheticVocalDataset(
-            num_speakers=8,
-            num_samples=num_synth,
+
+    if use_auto_hf:
+        hf_dir = fetch_and_prepare_hf_dataset(
+            output_dir=args.hf_data_dir,
+            repo_id=args.hf_repo,
+            samples_per_speaker=args.samples_per_speaker,
+        )
+        print(f"[Train] Loading Hugging Face WAV dataset from: {hf_dir}")
+        return WAVVoiceDataset(
+            data_dir=hf_dir,
             segment_frames=args.segment_frames,
         )
 
+    num_synth = max(40, (args.steps_per_epoch or 20) * args.batch_size)
+    print(f"[Train] Running synthetic multi-speaker warmstart ({num_synth} samples)")
+    return SyntheticVocalDataset(
+        num_speakers=8,
+        num_samples=num_synth,
+        segment_frames=args.segment_frames,
+    )
+
+
+def _run_training(args: argparse.Namespace, dataset, device: str) -> None:
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -112,7 +176,10 @@ def main() -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         print(f"[Train] Resumed from {args.resume} at step {trainer.global_step}")
 
-    print(f"[Train] Device={device} | Epochs={args.epochs} | Steps/Epoch={steps_per_ep} | Batch={args.batch_size}")
+    print(
+        f"[Train] Device={device} | Epochs={args.epochs} | "
+        f"Steps/Epoch={steps_per_ep} | Batch={args.batch_size}"
+    )
 
     last_metrics = {}
     for epoch in range(start_epoch, start_epoch + args.epochs):
@@ -139,7 +206,9 @@ def main() -> None:
             f"spk={avg_metrics['spk_loss']:.4f} | voc={avg_metrics['vocoder_loss']:.4f}"
         )
 
-    saved = trainer.save_checkpoint(args.save_path, epoch=start_epoch + args.epochs - 1, metrics=last_metrics)
+    saved = trainer.save_checkpoint(
+        args.save_path, epoch=start_epoch + args.epochs - 1, metrics=last_metrics
+    )
     print(f"[Train] Saved checkpoint: {saved}")
 
     if args.export_onnx:
