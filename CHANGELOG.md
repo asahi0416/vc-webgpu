@@ -25,3 +25,6 @@
 - 追加学習（大規模化）: Common Voice 8シャード＋JVNV 232話者で20エポック再開学習
   - 内容: `data/mixed` を232話者（JVNV 4話者＋CV擬似228話者・2,588 WAV）へ拡張して Epoch 46→65 の20エポック学習を実行（`total_loss` 4.1324→3.2952、`mel_l1` 0.8431→0.6357、`spk_loss` 0.0614→0.0320、`vocoder_loss` 1.7974→1.4975）、`checkpoints/vc_latest.pt` と `models/*.onnx` を更新（一時ログ `prep.log` / `train_big.log` を整理）
   - 理由: さらに多様な話者分布でゼロショット話者類似度と再構成品質を向上させるため
+- Causal NSFボコーダ導入・Slaneyメル補正・話者F0/音色適応強化と再学習
+  - 内容: `CausalVocosVocoder` の連続位相ハーモニック+ノイズNSF励起・`log_fb_sum`補正・33ビン局所周波数包絡正規化、`CausalFlowMatchingDecoder.out_proj.bias=-5.5` 初期化、`CausalPitchConditioner.spk_f0_head` の `LayerNorm` 付きMLP化、`SpeakerEncoder.encode_mel` によるサイクル話者損失追加、フォルマント摂動強化（`0.75〜1.25`）を実装し、`data/jvnv`（400発話）で15エポック新規学習（`total=9.5047→5.1588`, `voc=2.1188→1.8133`）および ONNX 再エクスポート・全11テスト合格を確認
+  - 理由: 100Hzフレーム周期の低音ロボット声・Slaneyスケールずれによる高域/音量歪み・男女ターゲットF0未適応・声色転写不足を根本解消するため
