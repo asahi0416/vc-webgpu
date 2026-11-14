@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Causal FlowVC — WebGPU Real-Time Voice Changer</title>
+  <link rel="stylesheet" href="/web/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.all.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="title-group">
+        <h1>Causal FlowVC <span class="badge-beta">WebGPU</span></h1>
+        <p class="subtitle">Zero-Shot Causal Consistency Flow Matching Voice Changer</p>
+      </div>
+      <div class="status-pills">
+        <div class="pill" id="pill-backend">
+          <span class="dot" id="dot-backend"></span>
+          <span id="status-backend">バックエンド確認中...</span>
+        </div>
+        <div class="pill" id="pill-model">
+          <span class="dot" id="dot-model"></span>
+          <span id="status-model">モデル読込中...</span>
+        </div>
+        <div class="pill pill-spec">
+          <span>24kHz / 40ms Chunk (960 smp)</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="grid-layout">
+      <!-- Step 1: Speaker Reference -->
+      <section class="card">
+        <div class="card-header">
+          <span class="step-tag">STEP 1</span>
+          <h2>参照音声クローン (3秒ゼロショット)</h2>
+        </div>
+        <p class="card-desc">
+          3秒程度の音声から256次元話者ベクトルを抽出します（初回のみ・推論中は固定キャッシュ）。
+        </p>
+
+        <div class="btn-row">
+          <label class="btn btn-secondary file-btn">
+            <input type="file" id="ref-file-input" accept="audio/*" hidden />
+            📁 音声ファイル選択
+          </label>
+          <button id="btn-record-ref" class="btn btn-secondary" disabled>
+            🎙️ 3秒マイク録音
+          </button>
+          <button id="btn-test-ref" class="btn btn-primary" disabled>
+            ⚡ テスト参照音声で抽出
+          </button>
+        </div>
+
+        <div class="metric-strip">
+          <div class="metric-box">
+            <span class="metric-label">話者ステータス</span>
+            <span class="metric-value" id="ref-status">未抽出</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">抽出時間</span>
+            <span class="metric-value" id="ref-time">-- ms</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">L2ノルム</span>
+            <span class="metric-value" id="ref-norm">--</span>
+          </div>
+        </div>
+
+        <div class="canvas-wrap">
+          <div class="canvas-label">256次元 Speaker Embedding ビジュアライザ</div>
+          <canvas id="canvas-spk-emb" width="600" height="90"></canvas>
+        </div>
+      </section>
+
+      <!-- Step 2: Realtime Voice Conversion -->
+      <section class="card">
+        <div class="card-header">
+          <span class="step-tag">STEP 2</span>
+          <h2>リアルタイム音声変換 (AudioWorklet)</h2>
+        </div>
+        <p class="card-desc">
+          40msチャンク単位で因果キャッシュを引き継ぎながら声質と音程をリアルタイム変換します。
+        </p>
+
+        <div class="control-block">
+          <div class="slider-header">
+            <label for="pitch-slider">ピッチシフト (半音)</label>
+            <span class="slider-val" id="pitch-value">+0.0 st</span>
+          </div>
+          <input type="range" id="pitch-slider" min="-12" max="12" step="0.5" value="0" />
+          <div class="preset-row">
+            <button class="chip pitch-preset" data-pitch="-12">-12 (男声化)</button>
+            <button class="chip pitch-preset" data-pitch="-5">-5</button>
+            <button class="chip pitch-preset active" data-pitch="0">0 (原音高)</button>
+            <button class="chip pitch-preset" data-pitch="5">+5</button>
+            <button class="chip pitch-preset" data-pitch="12">+12 (女声化)</button>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button id="btn-toggle-vc" class="btn btn-accent" disabled>
+            ▶️ リアルタイム変換開始
+          </button>
+          <button id="btn-bypass" class="btn btn-secondary" disabled>
+            🔀 バイパス: OFF
+          </button>
+          <button id="btn-reset-cache" class="btn btn-secondary" disabled>
+            🔄 キャッシュリセット
+          </button>
+        </div>
+
+        <div class="meters">
+          <div class="meter-row">
+            <span>Input</span>
+            <div class="meter-track"><div class="meter-fill" id="meter-in"></div></div>
+          </div>
+          <div class="meter-row">
+            <span>Output</span>
+            <div class="meter-track"><div class="meter-fill meter-out" id="meter-out"></div></div>
+          </div>
+        </div>
+
+        <div class="canvas-wrap">
+          <div class="canvas-label">入出力オーディオ波形 (シアン: 入力 / ミント: 変換出力)</div>
+          <canvas id="canvas-waveform" width="600" height="120"></canvas>
+        </div>
+      </section>
+
+      <!-- Step 3: Benchmark & Performance -->
+      <section class="card card-full">
+        <div class="card-header">
+          <span class="step-tag">STEP 3</span>
+          <h2>リアルタイム性能 &amp; 実機ベンチマーク</h2>
+        </div>
+
+        <div class="bench-toolbar">
+          <button id="btn-run-benchmark" class="btn btn-primary" disabled>
+            🚀 20チャンク連続ベンチマーク (800ms分)
+          </button>
+          <span class="bench-note" id="bench-status">モデルのロード完了後に実行できます。</span>
+        </div>
+
+        <div class="metric-grid">
+          <div class="metric-box">
+            <span class="metric-label">平均チャンク推論時間</span>
+            <span class="metric-value highlight" id="perf-avg-ms">-- ms</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">最小 / 最大</span>
+            <span class="metric-value" id="perf-minmax-ms">-- / -- ms</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">RTF (Real-Time Factor)</span>
+            <span class="metric-value highlight" id="perf-rtf">--</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">処理チャンク累計</span>
+            <span class="metric-value" id="perf-chunks">0</span>
+          </div>
+        </div>
+
+        <div class="log-box" id="app-log" aria-live="polite"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

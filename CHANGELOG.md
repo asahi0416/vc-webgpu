@@ -7,3 +7,6 @@
 - Step 1 & Step 2 実装: Causal Flow Matching VCコアモデルとONNXエクスポート
   - 内容: `src/models/` 配下（因果STFT/COLA iSTFT, CausalConvNeXt, SpeakerEncoder, CausalContentEncoder/PitchConditioner, CausalFlowMatchingDecoder, CausalVocosVocoder, StreamingFlowMatchingVC）、`src/export_onnx.py`、`tests/test_models_and_onnx.py` を実装・検証
   - 理由: WebGPU / ONNX Runtime上で40msチャンク単位の超低遅延・因果的ゼロショットボイスチェンジを実現するため
+- Step 3 実装: WebGPU ＋ AudioWorklet ブラウザアプリ構築と実機検証
+  - 内容: `src/server.py`（COOP/COEP対応ローカルサーバー）、`web/index.html`、`web/styles.css`、`web/app.js`、`web/vc-audio-worklet.js`、`tests/test_web_server.py` を実装し、ONNX Runtime Web (1.20.1) での話者抽出・20チャンク連続ベンチマーク（平均10.64ms / RTF 0.266）およびリロード時ウォームアップ順序バグ修正を実施
+  - 理由: iPhone（iOS Safari）およびPCブラウザ上でサーバー処理なしのクライアント完結リアルタイムボイスチェンジャーと実機計測を実現するため
