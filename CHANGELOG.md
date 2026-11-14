@@ -28,3 +28,6 @@
 - Causal NSFボコーダ導入・Slaneyメル補正・話者F0/音色適応強化と再学習
   - 内容: `CausalVocosVocoder` の連続位相ハーモニック+ノイズNSF励起・`log_fb_sum`補正・33ビン局所周波数包絡正規化、`CausalFlowMatchingDecoder.out_proj.bias=-5.5` 初期化、`CausalPitchConditioner.spk_f0_head` の `LayerNorm` 付きMLP化、`SpeakerEncoder.encode_mel` によるサイクル話者損失追加、フォルマント摂動強化（`0.75〜1.25`）を実装し、`data/jvnv`（400発話）で15エポック新規学習（`total=9.5047→5.1588`, `voc=2.1188→1.8133`）および ONNX 再エクスポート・全11テスト合格を確認
   - 理由: 100Hzフレーム周期の低音ロボット声・Slaneyスケールずれによる高域/音量歪み・男女ターゲットF0未適応・声色転写不足を根本解消するため
+- ハーモニックコームF0・無音ゲート厳格化・ゼロショット包絡/VTL転写・sub-F0抑制・低ノイズFlow刷新と再学習
+  - 内容: `build_harmonic_comb_bank`・`extract_f0_autocorr`（`rms_thresh=0.015`, `voicing_thresh=0.55`）・`CausalPitchConditioner` の無音UVゲート強化と因果F0平滑化、`SpeakerEncoder` への80次元有声包絡・log-F0埋め込み及び低域重み付けプーリング、`CausalFlowMatchingDecoder.compute_target_base_mel`（15ビン包絡＋5タップVTLフォルマントワープ＋AGC＋`0.04*x_0` 低ノイズFlow）、`CausalVocosVocoder` の `sub_f0_cut`、及び `VCTrainer` クロス話者包絡損失を追加し、`data/jvnv` で15エポック学習（`total=5.3325→3.4105`）・ONNX再出力・定量検証・全11テスト合格を確認
+  - 理由: ピッチの急激な高低飛び、低音の同時混入、無音ノイズ漏れ、フレーム間ノイズ揺れ、およびゼロショット話者類似度不足を解消するため
