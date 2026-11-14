@@ -156,11 +156,39 @@ def _build_dataset(args: argparse.Namespace, use_auto_hf: bool):
     )
 
 
+def _build_balanced_sampler(dataset):
+    """Balance rare vs studio speakers cleanly when speaker file counts differ strongly."""
+    if not hasattr(dataset, "speaker_files") or not hasattr(dataset, "items"):
+        return None
+    spk_counts = {sid: len(files) for sid, files in dataset.speaker_files.items() if files}
+    if len(spk_counts) <= 1:
+        return None
+    counts = sorted(spk_counts.values())
+    med_cnt = counts[len(counts) // 2]
+    large_spks = {sid for sid, c in spk_counts.items() if c > med_cnt * 2}
+    if not large_spks or len(large_spks) == len(spk_counts):
+        return None
+
+    from torch.utils.data import WeightedRandomSampler
+
+    small_spks = set(spk_counts.keys()) - large_spks
+    weights = []
+    for spk_id, _ in dataset.items:
+        c = spk_counts[spk_id]
+        if spk_id in large_spks:
+            weights.append(0.25 / (len(large_spks) * c))
+        else:
+            weights.append(0.75 / (len(small_spks) * c))
+    return WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
+
+
 def _run_training(args: argparse.Namespace, dataset, device: str) -> None:
+    sampler = _build_balanced_sampler(dataset)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=(sampler is None),
         drop_last=len(dataset) >= args.batch_size,
     )
 

@@ -94,8 +94,9 @@ class CausalFlowMatchingDecoder(nn.Module):
         w_detail = w_formant - w_broad
 
         voice_gate = torch.sigmoid((src_frame_mean + 8.3) * 2.0)
-        norm_frame_mean = -4.2 + 2.6 * torch.tanh((src_frame_mean + 5.0) / 2.6)
-        return norm_frame_mean + 0.35 * w_detail + voice_gate * tgt_shape
+        voiced_norm = -4.8 + 1.2 * torch.tanh((src_frame_mean + 5.6) / 1.8)
+        norm_frame_mean = src_frame_mean * (1.0 - voice_gate) + voice_gate * voiced_norm
+        return norm_frame_mean + 0.25 * w_detail + voice_gate * tgt_shape
 
     def forward_velocity(
         self,
@@ -155,7 +156,7 @@ class CausalFlowMatchingDecoder(nn.Module):
             next_step_caches.append(cache_out_k)
 
         if base_mel is not None:
-            x = anchor + 0.80 * torch.tanh((x - anchor) / 0.80)
+            x = anchor + 2.80 * torch.tanh((x - anchor) / 2.80)
 
         flow_cache_out = torch.stack(next_step_caches, dim=0)
         return x, flow_cache_out

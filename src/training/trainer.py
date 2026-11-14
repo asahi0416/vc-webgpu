@@ -40,6 +40,18 @@ def _compute_gain_aug_mel(
     return mel_extractor(audio * gain, stft_zero)[:2]
 
 
+@torch.no_grad()
+def _apply_channel_aug_mel(mel: torch.Tensor) -> torch.Tensor:
+    """Apply random mic spectral tilt, HF rolloff, and gain offset without altering vocal identity."""
+    bsz, n_mels, _ = mel.shape
+    freqs = torch.linspace(-1.0, 1.0, n_mels, device=mel.device, dtype=mel.dtype).view(1, n_mels, 1)
+    tilt = torch.empty(bsz, 1, 1, device=mel.device, dtype=mel.dtype).uniform_(-1.2, 1.2)
+    hf_mask = torch.sigmoid((freqs - 0.50) * 10.0)
+    hf_drop = torch.empty(bsz, 1, 1, device=mel.device, dtype=mel.dtype).uniform_(-3.0, 0.0)
+    gain_shift = torch.empty(bsz, 1, 1, device=mel.device, dtype=mel.dtype).uniform_(-0.8, 0.8)
+    return torch.clamp(mel + tilt * freqs + hf_drop * hf_mask + gain_shift, min=-11.5)
+
+
 @contextmanager
 def _frozen_params(module: nn.Module) -> Iterator[None]:
     """Temporarily freeze module parameter grads while keeping inputs differentiable."""
@@ -92,11 +104,17 @@ class VCTrainer:
         # 2. Target acoustic features & causal ground-truth F0 (plus quiet-to-loud mic gain src)
         stft_zero = torch.zeros(batch_size, 1, STFT_CACHE_LEN, device=self.device)
         tgt_mel, tgt_mag, _ = self.model.core.mel_extractor(audio, stft_zero)
-        spk_tgt_mel = self.model.speaker_encoder.encode_mel(tgt_mel.detach(), tgt_mag.detach())
+        aug_tgt_mel = _apply_channel_aug_mel(tgt_mel.detach())
+        spk_tgt_mel = self.model.speaker_encoder.encode_mel(aug_tgt_mel, tgt_mag.detach())
+        neural_start = N_MELS + 1
+        neu_emb = F.normalize(spk_emb[:, neural_start:], p=2.0, dim=-1)
+        neu_tgt = F.normalize(spk_tgt_mel[:, neural_start:], p=2.0, dim=-1)
         spk_loss = (
             self.spk_loss_fn(spk_emb, speaker_ids)
+            + 0.6 * self.spk_loss_fn(neu_emb, speaker_ids)
             + 0.5 * self.spk_loss_fn(spk_tgt_mel, speaker_ids)
             + (1.0 - (spk_emb * spk_tgt_mel).sum(dim=-1)).mean()
+            + 0.8 * (1.0 - (neu_emb * neu_tgt).sum(dim=-1)).mean()
         )
         src_mel, src_mag = _compute_gain_aug_mel(self.model.core.mel_extractor, audio, stft_zero)
         gt_f0, gt_uv = extract_f0_autocorr(audio)
@@ -105,7 +123,7 @@ class VCTrainer:
 
         # 3. Perturbation-invariant ContentEncoder & gain-tolerant Pitch estimation
         perturbed_src_mel = apply_mel_formant_perturbation(src_mel.detach())
-        base_in_mel = apply_mel_formant_perturbation(tgt_mel.detach())
+        base_in_mel = perturbed_src_mel
         ce = self.model.core.content_encoder
         pc = self.model.core.pitch_conditioner
         ce_cache = torch.zeros(ce.num_layers, batch_size, ce.dim, ce.pad_len, device=self.device)
@@ -113,17 +131,19 @@ class VCTrainer:
 
         content_feat, _ = ce(perturbed_src_mel, ce_cache)
         content_clean, _ = ce(tgt_mel.detach(), ce_cache)
-        content_inv_loss = (1.0 - F.cosine_similarity(content_feat, content_clean, dim=1)).mean()
-        uv_w = gt_uv / (gt_uv.sum(dim=-1, keepdim=True) + 1e-5)
-        c_utt_clean = (content_clean * uv_w).sum(dim=-1)
-        c_utt_pert = (content_feat * uv_w).sum(dim=-1)
-        if batch_size > 1:
-            content_bias_loss = (
-                (c_utt_clean - c_utt_clean.mean(dim=0, keepdim=True).detach()).pow(2).mean()
-                + (c_utt_pert - c_utt_pert.mean(dim=0, keepdim=True).detach()).pow(2).mean()
-            )
-        else:
-            content_bias_loss = content_feat.sum() * 0.0
+        # Center along time so DC bias cannot cheat; VICReg variance floor prevents phoneme collapse
+        c_clean_dyn = content_clean - content_clean.mean(dim=-1, keepdim=True)
+        c_pert_dyn = content_feat - content_feat.mean(dim=-1, keepdim=True)
+        active_w = torch.sigmoid((tgt_mel[:, 2:30, :].mean(dim=1) + 7.5) * 2.0)
+        dyn_cos = F.cosine_similarity(c_pert_dyn, c_clean_dyn, dim=1)
+        content_inv_loss = ((1.0 - dyn_cos) * active_w).sum() / (active_w.sum() + 1e-5)
+        c_var_t = torch.sqrt(c_clean_dyn.pow(2).mean(dim=-1) + 1e-4)
+        c_pert_var_t = torch.sqrt(c_pert_dyn.pow(2).mean(dim=-1) + 1e-4)
+        content_var_loss = F.relu(0.65 - c_var_t).mean() + F.relu(0.65 - c_pert_var_t).mean()
+        content_bias_loss = (
+            content_clean.mean(dim=-1).pow(2).mean()
+            + content_feat.mean(dim=-1).pow(2).mean()
+        )
         pitch_shift = torch.zeros(batch_size, 1, device=self.device)
         f0_feat, pred_f0, pred_uv, _ = pc(
             src_mag, perturbed_src_mel, pitch_shift, pc_cache, spk_emb=spk_emb
@@ -196,8 +216,10 @@ class VCTrainer:
             num_steps=self.model.core.num_flow_steps,
             base_mel=base_mel,
         )
-        mel_l1_loss = F.l1_loss(pred_mel, tgt_mel) + 0.5 * F.l1_loss(
-            _hp15_formants(pred_mel), _hp15_formants(tgt_mel).detach()
+        mel_l1_loss = (
+            F.l1_loss(pred_mel, tgt_mel)
+            + 0.6 * F.l1_loss(_hp15_formants(pred_mel), _hp15_formants(tgt_mel).detach())
+            + 0.4 * F.l1_loss(pred_mel.std(dim=1), tgt_mel.std(dim=1).detach())
         )
 
         # Cross-speaker shuffled neural speaker similarity + content consistency + envelope loss
@@ -266,7 +288,9 @@ class VCTrainer:
 
             with _frozen_params(ce):
                 pred_content_shuf, _ = ce(pred_mel_shuf, ce_cache)
-            content_cycle = F.l1_loss(pred_content_shuf, content_feat.detach())
+            pred_c_dyn = pred_content_shuf - pred_content_shuf.mean(dim=-1, keepdim=True)
+            cycle_cos = F.cosine_similarity(pred_c_dyn, c_pert_dyn.detach(), dim=1)
+            content_cycle = ((1.0 - cycle_cos) * active_w).sum() / (active_w.sum() + 1e-5)
             energy_loss = F.l1_loss(pred_mel_shuf.mean(dim=1), tgt_mel.mean(dim=1).detach())
             sharp_loss = F.l1_loss(_hp15_formant_std(pred_mel_shuf), _hp15_formant_std(tgt_mel).detach())
 
@@ -274,9 +298,9 @@ class VCTrainer:
                 (pred_shape_shuf - tgt_shape_shuf).abs().mean()
                 + 0.8 * target_spk_sim
                 + 0.6 * src_repel
-                + 0.5 * content_cycle
+                + 0.6 * content_cycle
                 + 0.4 * energy_loss
-                + 0.3 * sharp_loss
+                + 0.4 * sharp_loss
             )
         else:
             cross_env_loss = pred_mel.sum() * 0.0
@@ -286,7 +310,7 @@ class VCTrainer:
         voc_cache = torch.zeros(voc.num_layers, batch_size, voc.dim, voc.pad_len, device=self.device)
         ola_cache = torch.zeros(batch_size, STFT_CACHE_LEN, device=self.device)
 
-        voc_in_mel = 0.3 * tgt_mel.detach() + 0.7 * pred_mel.detach()
+        voc_in_mel = 0.5 * tgt_mel.detach() + 0.5 * pred_mel.detach()
         pred_audio, _, _ = voc(
             voc_in_mel,
             spk_emb,
@@ -323,11 +347,12 @@ class VCTrainer:
         total_loss = (
             rf_loss
             + 0.5 * cm_loss
-            + 0.5 * mel_l1_loss
+            + 0.8 * mel_l1_loss
             + 0.6 * content_inv_loss
-            + 0.8 * content_bias_loss
+            + 0.8 * content_var_loss
+            + 0.15 * content_bias_loss
             + 1.0 * f0_loss
-            + 0.5 * spk_loss
+            + 0.6 * spk_loss
             + 0.5 * mel_spk_loss
             + 0.5 * cross_env_loss
             + vocoder_loss

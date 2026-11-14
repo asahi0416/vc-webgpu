@@ -68,7 +68,7 @@ class CausalContentEncoder(nn.Module):
             nn.Conv1d(dim, bottleneck_dim, kernel_size=1),
             nn.Tanh(),
             ChannelLayerNorm(bottleneck_dim),
-            _TrainingBottleneckNoise(noise_std=0.25),
+            _TrainingBottleneckNoise(noise_std=0.12),
             nn.Conv1d(bottleneck_dim, dim, kernel_size=1),
         )
 

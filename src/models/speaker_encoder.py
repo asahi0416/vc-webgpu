@@ -170,7 +170,9 @@ class SpeakerEncoder(nn.Module):
         ac_scale = torch.clamp(math.sqrt(0.80) * torch.rsqrt(torch.clamp(ac_sq, min=1e-6)), max=1.0)
         emb_ac = raw_ac * ac_scale
 
-        h = self.in_conv(log_mel)
+        # Center per-frame level before neural encoder so mic gain never leaks as identity
+        mel_c = log_mel - log_mel.mean(dim=1, keepdim=True)
+        h = self.in_conv(mel_c)
         for block in self.blocks:
             h = block(h)
 
