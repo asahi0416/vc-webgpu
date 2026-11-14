@@ -15,27 +15,12 @@ def extract_f0_autocorr(
     sample_rate: int = SAMPLE_RATE,
     n_fft: int = N_FFT,
     hop_length: int = HOP_LENGTH,
-    f0_min: float = 60.0,
-    f0_max: float = 800.0,
-    voicing_thresh: float = 0.45,
+    f0_min: float = 65.0,
+    f0_max: float = 500.0,
+    voicing_thresh: float = 0.50,
     rms_thresh: float = 1e-3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract frame-wise ground-truth F0 (Hz) and voiced flag using causal NSDF autocorrelation.
-
-    Args:
-        audio: Waveform tensor of shape (B, T_samples), multiple of hop_length.
-        sample_rate: Audio sampling rate (default 24000).
-        n_fft: Analysis window size (default 960).
-        hop_length: Hop size (default 240).
-        f0_min: Minimum detectable F0 in Hz.
-        f0_max: Maximum detectable F0 in Hz.
-        voicing_thresh: Normalized autocorrelation threshold for voiced decision.
-        rms_thresh: Minimum frame RMS energy for voiced decision.
-
-    Returns:
-        gt_f0_hz: Estimated F0 in Hz of shape (B, 1, T_frames).
-        gt_uv: Binary voiced mask (0.0 or 1.0) of shape (B, 1, T_frames).
-    """
+    """Extract frame-wise ground-truth F0 (Hz) and voiced flag using low-pass NSDF autocorrelation."""
     pad_left = n_fft - hop_length
     padded = F.pad(audio, (pad_left, 0))
     frames = padded.unfold(dimension=-1, size=n_fft, step=hop_length)  # (B, T_frames, N)
@@ -44,23 +29,28 @@ def extract_f0_autocorr(
     rms = torch.sqrt(torch.mean(frames * frames, dim=-1) + 1e-12)  # (B, T_frames)
     centered = frames - frames.mean(dim=-1, keepdim=True)
 
-    # Fast autocorrelation via zero-padded RFFT
+    # Low-pass filter in RFFT domain (keep <= 500Hz intact, taper to 900Hz) to avoid formant octave jumps
     fft_size = 1
     while fft_size < 2 * win_len:
         fft_size *= 2
-    spec = torch.fft.rfft(centered, n=fft_size, dim=-1)
+    spec_raw = torch.fft.rfft(centered, n=fft_size, dim=-1)
+    freqs = torch.linspace(
+        0.0, float(sample_rate) / 2.0, spec_raw.shape[-1], device=audio.device, dtype=audio.dtype
+    )
+    lp_gain = torch.clamp(1.0 - (freqs - 500.0) / 400.0, 0.0, 1.0)
+    frames_lp = torch.fft.irfft(spec_raw * lp_gain, n=fft_size, dim=-1)[:, :, :win_len]
+    frames_lp = frames_lp - frames_lp.mean(dim=-1, keepdim=True)
+
+    spec = torch.fft.rfft(frames_lp, n=fft_size, dim=-1)
     acf = torch.fft.irfft(spec.real * spec.real + spec.imag * spec.imag, n=fft_size, dim=-1)
     acf = acf[:, :, :win_len]  # (B, T_frames, N)
 
     # Compute exact denominator m(tau) = sum_{n=0}^{N-1-tau} x^2 + sum_{n=tau}^{N-1} x^2
-    sq = centered * centered
+    sq = frames_lp * frames_lp
     prefix_sq = torch.cumsum(sq, dim=-1)
     total_energy = prefix_sq[:, :, -1:]  # (B, T_frames, 1)
 
-    # For lag tau in [0, N-1]:
-    # left_energy[tau] = sum_{n=0}^{N-1-tau} x[n]^2 = prefix_sq[N-1-tau]
     left_energy = torch.flip(prefix_sq, dims=[-1])  # index tau corresponds to N-1-tau
-    # right_energy[tau] = total_energy - prefix_sq[tau-1] (0 for tau=0)
     shifted_prefix = F.pad(prefix_sq[:, :, :-1], (1, 0))
     right_energy = total_energy - shifted_prefix
     denom = left_energy + right_energy + 1e-8
@@ -78,7 +68,7 @@ def extract_f0_autocorr(
     center = sub_nsdf[:, :, 1:-1]
     right = sub_nsdf[:, :, 2:]
     is_peak = (center > left) & (center >= right)
-    strong_peak = is_peak & (center >= 0.85 * torch.clamp(max_val, min=0.0))
+    strong_peak = is_peak & (center >= 0.95 * torch.clamp(max_val, min=0.0))
 
     has_peak = strong_peak.any(dim=-1)
     first_peak_offset = torch.argmax(strong_peak.to(torch.int64), dim=-1)  # index in center (offset +1)

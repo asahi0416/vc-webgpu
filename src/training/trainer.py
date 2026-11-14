@@ -58,6 +58,8 @@ class VCTrainer:
         stft_zero = torch.zeros(batch_size, 1, STFT_CACHE_LEN, device=self.device)
         tgt_mel, tgt_mag, _ = self.model.core.mel_extractor(audio, stft_zero)
         gt_f0, gt_uv = extract_f0_autocorr(audio)
+        ref_len = (min(ref_audio.shape[1], SAMPLE_RATE) // HOP_LENGTH) * HOP_LENGTH
+        ref_f0, ref_uv = extract_f0_autocorr(ref_audio[:, :ref_len])
 
         # 3. Information perturbation on source mel -> Content & Pitch estimation
         perturbed_mel = apply_mel_formant_perturbation(tgt_mel.detach())
@@ -68,18 +70,36 @@ class VCTrainer:
 
         content_feat, _ = ce(perturbed_mel, ce_cache)
         pitch_shift = torch.zeros(batch_size, 1, device=self.device)
-        f0_feat, pred_f0, pred_uv, _ = pc(tgt_mag, perturbed_mel, pitch_shift, pc_cache)
+        f0_feat, pred_f0, pred_uv, _ = pc(
+            tgt_mag, perturbed_mel, pitch_shift, pc_cache, spk_emb=spk_emb
+        )
 
-        # F0 L1 loss on voiced frames + Voiced/Unvoiced BCE
-        log_pred_f0 = torch.log(torch.clamp(pred_f0, min=20.0))
+        # F0 L1 loss on voiced frames + Voiced/Unvoiced BCE + Register F0 supervision
+        src_f0_hz = pc.last_src_f0_hz if pc.last_src_f0_hz is not None else pred_f0
+        log_pred_f0 = torch.log(torch.clamp(src_f0_hz, min=20.0))
         log_gt_f0 = torch.log(torch.clamp(gt_f0, min=20.0))
+        log_ref_f0 = torch.log(torch.clamp(ref_f0, min=20.0))
         voiced_mask = gt_uv > 0.5
         if voiced_mask.any():
             f0_l1 = F.l1_loss(log_pred_f0[voiced_mask], log_gt_f0[voiced_mask])
         else:
             f0_l1 = pred_f0.sum() * 0.0
         uv_bce = F.binary_cross_entropy(torch.clamp(pred_uv, 1e-4, 1.0 - 1e-4), gt_uv)
-        f0_loss = f0_l1 + 0.5 * uv_bce
+
+        base_terms = []
+        src_base = pc.last_src_base_log_f0
+        tgt_base = pc.last_tgt_base_log_f0
+        for b in range(batch_size):
+            vm_src = gt_uv[b] > 0.5
+            if vm_src.any() and src_base is not None:
+                utt_src_mean = log_gt_f0[b][vm_src].mean()
+                base_terms.append(F.l1_loss(src_base[b], utt_src_mean.expand_as(src_base[b])))
+            vm_ref = ref_uv[b] > 0.5
+            if vm_ref.any() and tgt_base is not None:
+                utt_ref_mean = log_ref_f0[b][vm_ref].mean()
+                base_terms.append(F.l1_loss(tgt_base[b], utt_ref_mean.expand_as(tgt_base[b])))
+        base_f0_loss = torch.stack(base_terms).mean() if base_terms else pred_f0.sum() * 0.0
+        f0_loss = f0_l1 + 0.5 * uv_bce + 0.5 * base_f0_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
         cond_feat = content_feat + f0_feat
@@ -105,13 +125,21 @@ class VCTrainer:
         )
         mel_l1_loss = F.l1_loss(pred_mel, tgt_mel)
 
-        # 5. Causal Vocos Vocoder loss (aligned by STFT_CACHE_LEN=720 causal synthesis delay)
+        # 5. Causal NSF Vocos Vocoder loss (aligned by STFT_CACHE_LEN=720 causal synthesis delay)
         voc = self.model.core.vocoder
         voc_cache = torch.zeros(voc.num_layers, batch_size, voc.dim, voc.pad_len, device=self.device)
         ola_cache = torch.zeros(batch_size, STFT_CACHE_LEN, device=self.device)
 
         voc_in_mel = 0.7 * tgt_mel.detach() + 0.3 * pred_mel.detach()
-        pred_audio, _, _ = voc(voc_in_mel, spk_emb, voc_cache, ola_cache)
+        pred_audio, _, _ = voc(
+            voc_in_mel,
+            spk_emb,
+            voc_cache,
+            ola_cache,
+            f0_hz=gt_f0,
+            uv=gt_uv,
+            noise_seed=noise,
+        )
 
         delay = STFT_CACHE_LEN
         if audio.shape[1] > delay:
@@ -122,8 +150,19 @@ class VCTrainer:
             aligned_tgt = audio
 
         stft_loss = self.stft_loss_fn(aligned_pred, aligned_tgt)
-        wav_l1_loss = F.l1_loss(aligned_pred, aligned_tgt)
-        vocoder_loss = stft_loss + 2.0 * wav_l1_loss
+        aligned_frames = aligned_pred.shape[1] // HOP_LENGTH
+        if aligned_frames > 0:
+            trimmed_len = aligned_frames * HOP_LENGTH
+            pred_out_mel, _, _ = self.model.core.mel_extractor(
+                aligned_pred[:, :trimmed_len], stft_zero
+            )
+            tgt_out_mel, _, _ = self.model.core.mel_extractor(
+                aligned_tgt[:, :trimmed_len], stft_zero
+            )
+            voc_mel_loss = F.l1_loss(pred_out_mel, tgt_out_mel)
+        else:
+            voc_mel_loss = aligned_pred.sum() * 0.0
+        vocoder_loss = stft_loss + 0.5 * voc_mel_loss
 
         total_loss = (
             rf_loss

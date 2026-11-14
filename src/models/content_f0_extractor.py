@@ -1,7 +1,7 @@
 """Causal Content Encoder and Causal Pitch (F0) Conditioner."""
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ class CausalContentEncoder(nn.Module):
         self,
         n_mels: int = N_MELS,
         dim: int = 256,
-        bottleneck_dim: int = 64,
+        bottleneck_dim: int = 32,
         num_layers: int = 3,
         kernel_size: int = 7,
     ) -> None:
@@ -48,10 +48,27 @@ class CausalContentEncoder(nn.Module):
 
     @staticmethod
     def _normalize_frame_mel(log_mel: torch.Tensor) -> torch.Tensor:
-        """Per-frame normalization across mel bins to suppress volume/spectral tilt."""
-        mean = log_mel.mean(dim=1, keepdim=True)
-        var = ((log_mel - mean) ** 2).mean(dim=1, keepdim=True)
-        return (log_mel - mean) * torch.rsqrt(var + 1e-5)
+        """Smooth narrowband harmonics across mel bins and normalize per frame."""
+        padded = torch.cat(
+            [
+                log_mel[:, :1, :],
+                log_mel[:, :1, :],
+                log_mel,
+                log_mel[:, -1:, :],
+                log_mel[:, -1:, :],
+            ],
+            dim=1,
+        )
+        smoothed = (
+            padded[:, :-4, :]
+            + padded[:, 1:-3, :]
+            + padded[:, 2:-2, :]
+            + padded[:, 3:-1, :]
+            + padded[:, 4:, :]
+        ) * 0.2
+        mean = smoothed.mean(dim=1, keepdim=True)
+        var = ((smoothed - mean) ** 2).mean(dim=1, keepdim=True)
+        return (smoothed - mean) * torch.rsqrt(var + 1e-5)
 
     def forward(
         self,
@@ -118,11 +135,15 @@ class CausalPitchConditioner(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.f0_head = nn.Conv1d(hidden_dim, 2, kernel_size=1)
+        self.f0_head = nn.Conv1d(hidden_dim, 3, kernel_size=1)
+        self.spk_f0_head = nn.Linear(out_dim, 1)
 
         # Log-frequency bounds [50 Hz, 1100 Hz]
         self.log_f0_min = math.log(50.0)
         self.log_f0_range = math.log(1100.0) - math.log(50.0)
+        self.last_src_f0_hz: Optional[torch.Tensor] = None
+        self.last_src_base_log_f0: Optional[torch.Tensor] = None
+        self.last_tgt_base_log_f0: Optional[torch.Tensor] = None
 
         # Harmonic embedding frequencies
         harmonics = torch.arange(1, n_harmonics + 1, dtype=torch.float32).view(1, n_harmonics, 1)
@@ -141,21 +162,9 @@ class CausalPitchConditioner(nn.Module):
         log_mel: torch.Tensor,
         pitch_shift_semitones: torch.Tensor,
         cache_in: torch.Tensor,
+        spk_emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Estimate F0 causally, apply pitch shift, and return harmonic embedding.
-
-        Args:
-            mag: Linear magnitude spectrum (B, n_freq_bins, T).
-            log_mel: Log-mel spectrogram (B, n_mels, T).
-            pitch_shift_semitones: Semitone shift tensor of shape (B, 1).
-            cache_in: Layer caches of shape (num_layers, B, hidden_dim, pad_len).
-
-        Returns:
-            f0_feat: Harmonic pitch conditioning tensor (B, out_dim, T).
-            shifted_f0: Shifted F0 in Hz of shape (B, 1, T).
-            uv: Voiced probability in [0, 1] of shape (B, 1, T).
-            cache_out: Updated layer caches of shape (num_layers, B, hidden_dim, pad_len).
-        """
+        """Estimate F0 causally, adapt register to spk_emb, apply pitch shift, and return harmonic embedding."""
         low_mag = torch.log(torch.clamp(mag[:, : self.low_freq_bins, :], min=1e-5))
         x = torch.cat([low_mag, log_mel], dim=1)
         h = self.in_proj(x)
@@ -165,14 +174,28 @@ class CausalPitchConditioner(nn.Module):
             h, c_out = block(h, cache_in[i], cond_vec=None)
             next_caches.append(c_out)
 
-        pred = self.f0_head(h)  # (B, 2, T)
-        log_f0 = self.log_f0_min + torch.sigmoid(pred[:, 0:1, :]) * self.log_f0_range
+        pred = self.f0_head(h)  # (B, 3, T)
+        src_log_f0 = self.log_f0_min + torch.sigmoid(pred[:, 0:1, :]) * self.log_f0_range
         uv = torch.sigmoid(pred[:, 1:2, :])
+        src_base_log_f0 = self.log_f0_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_f0_range
 
-        # Shift F0 in Hz: f0 * 2^(semitones / 12)
+        if spk_emb is not None:
+            tgt_base_log_f0 = (
+                self.log_f0_min
+                + torch.sigmoid(self.spk_f0_head(spk_emb)).unsqueeze(-1) * self.log_f0_range
+            )
+            adapted_log_f0 = tgt_base_log_f0 + 0.85 * (src_log_f0 - src_base_log_f0)
+        else:
+            tgt_base_log_f0 = src_base_log_f0
+            adapted_log_f0 = src_log_f0
+
+        self.last_src_f0_hz = torch.exp(src_log_f0)
+        self.last_src_base_log_f0 = src_base_log_f0
+        self.last_tgt_base_log_f0 = tgt_base_log_f0
+
+        # Shift adapted F0 in Hz: f0 * 2^(semitones / 12)
         shift_factor = torch.pow(2.0, pitch_shift_semitones.unsqueeze(-1) / 12.0)
-        f0_hz = torch.exp(log_f0)
-        shifted_f0 = f0_hz * shift_factor
+        shifted_f0 = torch.clamp(torch.exp(adapted_log_f0) * shift_factor, min=50.0, max=800.0)
 
         # Harmonic sinusoidal embedding masked by voiced probability
         norm_hz = (shifted_f0 / 1000.0) * self.harmonics * (2.0 * math.pi)

@@ -79,8 +79,8 @@ class StreamingVCCore(nn.Module):
         """
         log_mel, mag, stft_cache_out = self.mel_extractor(audio_chunk, stft_cache_in)
         content_feat, content_cache_out = self.content_encoder(log_mel, content_cache_in)
-        f0_feat, _, _, f0_cache_out = self.pitch_conditioner(
-            mag, log_mel, pitch_shift_semitones, f0_cache_in
+        f0_feat, shifted_f0, uv, f0_cache_out = self.pitch_conditioner(
+            mag, log_mel, pitch_shift_semitones, f0_cache_in, spk_emb=spk_emb
         )
 
         cond_feat = content_feat + f0_feat
@@ -93,7 +93,13 @@ class StreamingVCCore(nn.Module):
         )
 
         audio_out, vocoder_cache_out, ola_cache_out = self.vocoder(
-            converted_mel, spk_emb, vocoder_cache_in, ola_cache_in
+            converted_mel,
+            spk_emb,
+            vocoder_cache_in,
+            ola_cache_in,
+            f0_hz=shifted_f0,
+            uv=uv,
+            noise_seed=noise_seed,
         )
         return (
             audio_out,
@@ -190,7 +196,7 @@ class StreamingFlowMatchingVC(nn.Module):
         pc_cache = torch.zeros(pc.num_layers, batch_size, pc.hidden_dim, pc.pad_len, device=device, dtype=dtype)
 
         content_feat, _ = ce(src_mel, ce_cache)
-        f0_feat, _, _, _ = pc(src_mag, src_mel, pitch_shift_semitones, pc_cache)
+        f0_feat, _, _, _ = pc(src_mag, src_mel, pitch_shift_semitones, pc_cache, spk_emb=spk_emb)
         cond_feat = content_feat + f0_feat
 
         # Target mel ground truth
