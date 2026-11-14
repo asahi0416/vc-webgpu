@@ -16,3 +16,9 @@
 - 方法B 実装: Hugging Face公開日本語音声コーパス自動取得・24kHz前処理とロールバック保護付き学習
   - 内容: `.gitignore` への `data/` 追加、`src/training/hf_dataset.py`（`TransactionalBackup` および `fetch_and_prepare_hf_dataset`）の実装、`src/train.py` の `--auto-hf` デフォルト化・CLI拡張、`tests/test_training_pipeline.py` への `test_transactional_backup_rollback` 追加、`litagin/jvnv_corpus_v1_no_nv` 20ファイル5エポック学習（総損失 45.3343→36.7219）・ONNX再エクスポート・全11テスト合格を確認
   - 理由: ユーザーの手動データ準備なしで高品質な日本語マルチスピーカー実音声を安全（失敗時ロールバック保証）かつ再現性高く学習データとして利用するため
+- 追加学習: JVNV 400ファイルで20エポック再開学習
+  - 内容: 総損失 23.95→5.00、checkpoints/vc_latest.pt と models/*.onnx を更新
+  - 理由: 20ファイル学習では不足していた音声再構成品質（mel L1）を改善するため
+- Common Voice擬似話者データ追加と追加学習
+  - 内容: src/prepare_common_voice.py を追加（話者埋め込みで擬似話者分割、TransactionalBackup保護）、data/mixed（64話者969本）で20エポック学習（総損失 5.63→4.02）、ONNX更新
+  - 理由: 4話者のみでは話者の多様性が不足し、ゼロショット汎化が見込めないため
