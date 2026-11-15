@@ -5,8 +5,8 @@
 
 const CHUNK_SAMPLES = 3200; // 200ms @ 16kHz
 const RING_BUFFER_SIZE = 64000; // 4s ring
-const PREROLL_SAMPLES = 6400; // wait for 2 converted chunks before playback (absorbs inference jitter)
-const MAX_QUEUED_SAMPLES = 19200; // cap latency drift (~1.2s)
+const PREROLL_SAMPLES = 9600; // wait for 3 converted chunks (600ms) before playback to absorb inference jitter
+const MAX_QUEUED_SAMPLES = 25600; // cap latency drift (~1.6s)
 
 class KnnStreamProcessor extends AudioWorkletProcessor {
   constructor() {

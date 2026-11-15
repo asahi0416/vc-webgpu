@@ -629,7 +629,26 @@
       const chunkBuf = new Float32Array(chunkLen);
       let inferTotalMs = 0;
       let playedChunks = 0;
-      let nextPlayTime = playCtx.currentTime + (isKnn ? 0.12 : 0.06);
+      // Pre-buffer initial chunks before starting audio clock so inference latency never causes initial underrun
+      const prebufferCount = Math.min(totalChunks, isKnn ? 3 : 2);
+      const prebuffered = [];
+      let nextPlayTime = 0;
+
+      const schedulePlay = (samples) => {
+        const audioBuf = playCtx.createBuffer(1, chunkLen, playRate);
+        audioBuf.copyToChannel(samples, 0);
+        const srcNode = playCtx.createBufferSource();
+        srcNode.buffer = audioBuf;
+        srcNode.connect(playCtx.destination);
+        const now = playCtx.currentTime;
+        if (nextPlayTime === 0) {
+          nextPlayTime = now + 0.05;
+        } else if (nextPlayTime < now + 0.005) {
+          nextPlayTime = now + (isKnn ? 0.15 : 0.05);
+        }
+        srcNode.start(nextPlayTime);
+        nextPlayTime += chunkLen / playRate;
+      };
 
       for (let idx = 0; idx < totalChunks; idx++) {
         if (state.fileAbort) break;
@@ -673,25 +692,29 @@
         }
 
         if (state.fileAbort) break;
-        const audioBuf = playCtx.createBuffer(1, chunkLen, playRate);
-        audioBuf.copyToChannel(playSamples, 0);
-        const srcNode = playCtx.createBufferSource();
-        srcNode.buffer = audioBuf;
-        srcNode.connect(playCtx.destination);
-        const now = playCtx.currentTime;
-        if (nextPlayTime < now) {
-          nextPlayTime = now + 0.02;
-        }
-        srcNode.start(nextPlayTime);
-        nextPlayTime += chunkLen / playRate;
         playedChunks = idx + 1;
+        if (idx < prebufferCount - 1) {
+          prebuffered.push(playSamples);
+          el.fileVcStatus.textContent = `先読みバッファ中 (${playedChunks}/${prebufferCount})...`;
+          continue;
+        }
+        if (prebuffered.length > 0) {
+          for (const buf of prebuffered) schedulePlay(buf);
+          prebuffered.length = 0;
+        }
+        schedulePlay(playSamples);
 
         el.fileVcStatus.textContent = `リアルタイム再生中 (${playedChunks}/${totalChunks})...`;
 
-        const maxAhead = isKnn ? 0.50 : 0.20;
+        const maxAhead = isKnn ? 1.20 : 0.30;
         while (!state.fileAbort && nextPlayTime - playCtx.currentTime > maxAhead) {
           await new Promise((r) => setTimeout(r, 25));
         }
+      }
+
+      if (!state.fileAbort && prebuffered.length > 0) {
+        for (const buf of prebuffered) schedulePlay(buf);
+        prebuffered.length = 0;
       }
 
       if (!state.fileAbort) {

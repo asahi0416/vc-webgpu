@@ -83,22 +83,23 @@
   function fastNsdfF0(buf, start, len, sr, fmin, fmax, prevF0) {
     if (start < 0 || start + len > buf.length || len < 400) return 0;
     let sq = 0;
-    for (let i = 0; i < len; i++) {
+    for (let i = 0; i < len; i += 2) {
       const v = buf[start + i];
       sq += v * v;
     }
-    if (Math.sqrt(sq / len) < 0.005) return 0;
+    if (Math.sqrt((sq * 2) / len) < 0.008) return 0;
 
     const minLag = Math.floor(sr / fmax);
     const maxLag = Math.min(Math.floor(len / 2), Math.floor(sr / fmin));
     const vals = new Float32Array(maxLag + 1);
     let bestLag = 0;
     let bestScore = -1;
-    for (let lag = minLag; lag <= maxLag; lag++) {
+    // Coarse search (step=2, subsampled i+=2) for ~4x speedup
+    for (let lag = minLag; lag <= maxLag; lag += 2) {
       let ab = 0;
       let denom = 1e-9;
       const lim = len - lag;
-      for (let i = 0; i < lim; i++) {
+      for (let i = 0; i < lim; i += 2) {
         const a = buf[start + i];
         const b = buf[start + i + lag];
         ab += a * b;
@@ -117,9 +118,36 @@
         bestLag = lag;
       }
     }
-    if (bestLag === 0 || vals[bestLag] < 0.38) return 0;
+    if (bestLag === 0) return 0;
+    // Fine search around bestLag
+    const r0 = Math.max(minLag, bestLag - 2);
+    const r1 = Math.min(maxLag, bestLag + 2);
+    bestScore = -1;
+    for (let lag = r0; lag <= r1; lag++) {
+      let ab = 0;
+      let denom = 1e-9;
+      const lim = len - lag;
+      for (let i = 0; i < lim; i++) {
+        const a = buf[start + i];
+        const b = buf[start + i + lag];
+        ab += a * b;
+        denom += a * a + b * b;
+      }
+      const v = (2 * ab) / denom;
+      vals[lag] = v;
+      let score = v;
+      if (prevF0 > 50) {
+        const octDiff = Math.abs(Math.log2(sr / lag / prevF0));
+        if (octDiff < 0.35) score += 0.06;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestLag = lag;
+      }
+    }
+    if (vals[bestLag] < 0.38) return 0;
     let lagRefined = bestLag;
-    if (bestLag > minLag && bestLag < maxLag) {
+    if (bestLag > r0 && bestLag < r1) {
       const y0 = vals[bestLag - 1];
       const y1 = vals[bestLag];
       const y2 = vals[bestLag + 1];
@@ -396,7 +424,13 @@
       for (let r = 0; r < n; r++) {
         const base = r * DIM;
         let dot = 0;
-        for (let d = 0; d < DIM; d++) dot += qBuf[d] * ref[base + d];
+        for (let d = 0; d < DIM; d += 4) {
+          dot +=
+            qBuf[d] * ref[base + d] +
+            qBuf[d + 1] * ref[base + d + 1] +
+            qBuf[d + 2] * ref[base + d + 2] +
+            qBuf[d + 3] * ref[base + d + 3];
+        }
         if (CONT_BONUS > 0 && p1 >= 0) {
           if (r === p1 + 1) dot += CONT_BONUS;
           else if (r === p1 + 2) dot += CONT_BONUS * 0.5;
