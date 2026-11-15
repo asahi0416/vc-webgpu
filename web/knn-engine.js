@@ -16,11 +16,17 @@
   const WIN_FRAMES = 75;
   const WIN_SAMPLES = 400 + HOP * (WIN_FRAMES - 1); // 24080
   const HF = 10; // new frames per step
-  const RW = 3; // WavLM right-context frames kept for emitted frames
+  const RW = 5; // WavLM right-context frames kept for emitted frames (100 ms)
   const LC = 6; // vocoder left context frames
   const RC = 3; // vocoder right context frames
+  const OVERLAP = 320; // 20 ms Hann crossfade across 200 ms chunks
   const DIM = 1024;
   const TOPK = 4;
+  const TEMP_WEIGHT = 20.0;
+  const CONT_BONUS = 0.04;
+  const CENTER_ALPHA = 0.5;
+  const GATE_LOW = 0.001;
+  const GATE_HIGH = 0.003;
   const CHUNK = HF * HOP; // 3200 samples = 200 ms
   const REF_EMIT = 40; // frames emitted per reference window
   const MAX_REF_SECONDS = 60;
@@ -80,9 +86,10 @@
       this.hifigan = null;
       this.ready = false;
       this.refRaw = null; // Float32Array(N*DIM)
-      this.refNorm = null; // Float32Array(N*DIM), row-normalised
+      this.refNorm = null; // Float32Array(N*DIM), row-normalised raw
+      this.refCentNorm = null; // Float32Array(N*DIM), speaker-centered normalised
       this.nRef = 0;
-      this.outGain = 2.5;
+      this.outGain = 1.8;
       this.lastWavlmMs = 0;
       this.lastHifiganMs = 0;
       this.lastMatchMs = 0;
@@ -108,6 +115,11 @@
     reset() {
       this.hist = new Float32Array(WIN_SAMPLES);
       this.matched = []; // array of Float32Array(DIM), keeps last LC+HF+RC frames
+      this.rmsFifo = []; // aligned frame RMS for soft silence gating
+      this.prevTail = null; // OVERLAP samples for Hann crossfade
+      this.prevTop1 = -10;
+      this.srcMean = new Float32Array(DIM);
+      this.srcMeanCount = 0;
       this.totalEmitted = 0;
     }
 
@@ -171,34 +183,83 @@
       const n = rows.length;
       const raw = new Float32Array(n * DIM);
       const norm = new Float32Array(n * DIM);
+      const mean = new Float32Array(DIM);
       for (let r = 0; r < n; r++) {
         raw.set(rows[r], r * DIM);
         let s = 0;
-        for (let d = 0; d < DIM; d++) s += rows[r][d] * rows[r][d];
+        for (let d = 0; d < DIM; d++) {
+          const v = rows[r][d];
+          s += v * v;
+          mean[d] += v;
+        }
         const inv = 1 / Math.sqrt(s + 1e-9);
         for (let d = 0; d < DIM; d++) norm[r * DIM + d] = rows[r][d] * inv;
       }
+      for (let d = 0; d < DIM; d++) mean[d] /= Math.max(1, n);
+
+      const centNorm = new Float32Array(n * DIM);
+      for (let r = 0; r < n; r++) {
+        const base = r * DIM;
+        let s = 0;
+        for (let d = 0; d < DIM; d++) {
+          const v = raw[base + d] - CENTER_ALPHA * mean[d];
+          centNorm[base + d] = v;
+          s += v * v;
+        }
+        const inv = 1 / Math.sqrt(s + 1e-9);
+        for (let d = 0; d < DIM; d++) centNorm[base + d] *= inv;
+      }
       this.refRaw = raw;
       this.refNorm = norm;
+      this.refCentNorm = centNorm;
       this.nRef = n;
       this.reset();
       return { frames: n, seconds: L / SR, buildMs: performance.now() - t0 };
     }
 
-    _matchFrame(q) {
+    _matchFrame(q, frameRms) {
       const n = this.nRef;
+      if (frameRms > 0.01) {
+        this.srcMeanCount += 1;
+        const am = 1 / Math.min(this.srcMeanCount, 100);
+        const om = 1 - am;
+        for (let d = 0; d < DIM; d++) {
+          this.srcMean[d] = om * this.srcMean[d] + am * q[d];
+        }
+      }
+
+      const useCent = CENTER_ALPHA > 0 && this.srcMeanCount >= 5;
+      const qBuf = new Float32Array(DIM);
       let s = 0;
-      for (let d = 0; d < DIM; d++) s += q[d] * q[d];
+      if (useCent) {
+        for (let d = 0; d < DIM; d++) {
+          const v = q[d] - CENTER_ALPHA * this.srcMean[d];
+          qBuf[d] = v;
+          s += v * v;
+        }
+      } else {
+        for (let d = 0; d < DIM; d++) {
+          const v = q[d];
+          qBuf[d] = v;
+          s += v * v;
+        }
+      }
       const inv = 1 / Math.sqrt(s + 1e-9);
+      for (let d = 0; d < DIM; d++) qBuf[d] *= inv;
+
+      const ref = useCent ? this.refCentNorm : this.refNorm;
       const topS = new Float32Array(TOPK).fill(-Infinity);
       const topI = new Int32Array(TOPK).fill(0);
-      const ref = this.refNorm;
+      const p1 = this.prevTop1;
       for (let r = 0; r < n; r++) {
         const base = r * DIM;
         let dot = 0;
-        for (let d = 0; d < DIM; d++) dot += q[d] * ref[base + d];
-        dot *= inv;
-        // replace the smallest of the current top-k
+        for (let d = 0; d < DIM; d++) dot += qBuf[d] * ref[base + d];
+        if (CONT_BONUS > 0 && p1 >= 0) {
+          if (r === p1 + 1) dot += CONT_BONUS;
+          else if (r === p1 + 2) dot += CONT_BONUS * 0.5;
+          else if (r === p1) dot += CONT_BONUS * 0.25;
+        }
         let mi = 0;
         for (let k = 1; k < TOPK; k++) if (topS[k] < topS[mi]) mi = k;
         if (dot > topS[mi]) {
@@ -206,18 +267,32 @@
           topI[mi] = r;
         }
       }
+
+      let bestK = 0;
+      for (let k = 1; k < TOPK; k++) if (topS[k] > topS[bestK]) bestK = k;
+      this.prevTop1 = topI[bestK];
+      const maxS = topS[bestK];
+
+      const weights = new Float32Array(TOPK);
+      let wSum = 0;
+      for (let k = 0; k < TOPK; k++) {
+        const w = Math.exp((topS[k] - maxS) * TEMP_WEIGHT);
+        weights[k] = w;
+        wSum += w;
+      }
+
       const out = new Float32Array(DIM);
       for (let k = 0; k < TOPK; k++) {
+        const w = weights[k] / wSum;
         const base = topI[k] * DIM;
-        for (let d = 0; d < DIM; d++) out[d] += this.refRaw[base + d];
+        for (let d = 0; d < DIM; d++) out[d] += this.refRaw[base + d] * w;
       }
-      for (let d = 0; d < DIM; d++) out[d] /= TOPK;
       return out;
     }
 
     /**
      * Feed exactly CHUNK (3200) input samples @16 kHz; returns CHUNK output samples @16 kHz.
-     * Output lags input by ~5160 samples (aligned later by the caller if needed).
+     * Output lags input by ~5800 samples (aligned later by the caller if needed).
      */
     async processChunk(chunk) {
       if (!this.ready) throw new Error("kNN-VC エンジン未初期化");
@@ -229,13 +304,22 @@
       const t0 = performance.now();
       const j0 = WIN_FRAMES - RW - HF;
       for (let k = 0; k < HF; k++) {
+        const st = (j0 + k) * HOP;
+        let sq = 0;
+        for (let i = 0; i < 400; i++) {
+          const v = this.hist[st + i];
+          sq += v * v;
+        }
+        const frameRms = Math.sqrt(sq / 400);
+        this.rmsFifo.push(frameRms);
         const q = feat.subarray((j0 + k) * DIM, (j0 + k + 1) * DIM);
-        this.matched.push(this._matchFrame(q));
+        this.matched.push(this._matchFrame(q, frameRms));
       }
       this.totalEmitted += HF;
       this.lastMatchMs = performance.now() - t0;
       const need = LC + HF + RC;
       if (this.matched.length > need) this.matched.splice(0, this.matched.length - need);
+      if (this.rmsFifo.length > need) this.rmsFifo.splice(0, this.rmsFifo.length - need);
 
       const flat = new Float32Array(need * DIM);
       const pad = need - this.matched.length;
@@ -245,12 +329,28 @@
         flat.set(src, i * DIM);
       }
       const wav = await this._vocode(flat);
-      const out = new Float32Array(CHUNK);
       const s0 = LC * HOP;
+      const seg = wav.subarray(s0, s0 + CHUNK + OVERLAP).slice();
+      if (this.prevTail) {
+        for (let i = 0; i < OVERLAP; i++) {
+          const a = 0.5 * (1 - Math.cos((Math.PI * i) / OVERLAP));
+          seg[i] = this.prevTail[i] * (1 - a) + seg[i] * a;
+        }
+      }
+      this.prevTail = seg.subarray(CHUNK, CHUNK + OVERLAP).slice();
+
+      const out = new Float32Array(CHUNK);
       const g = this.outGain;
-      for (let i = 0; i < CHUNK; i++) {
-        const v = wav[s0 + i] * g;
-        out[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+      const firstRms = this.rmsFifo[0];
+      for (let k = 0; k < HF; k++) {
+        const idx = LC + k;
+        const rk = idx < pad ? firstRms : this.rmsFifo[idx - pad];
+        const gate = Math.min(1.0, Math.max(0.02, (rk - GATE_LOW) / (GATE_HIGH - GATE_LOW)));
+        const scale = g * gate;
+        const base = k * HOP;
+        for (let i = 0; i < HOP; i++) {
+          out[base + i] = Math.tanh(seg[base + i] * scale);
+        }
       }
       return out;
     }
@@ -259,8 +359,7 @@
   KnnVcEngine.CHUNK = CHUNK;
   KnnVcEngine.SAMPLE_RATE = SR;
   KnnVcEngine.resampleMono = resampleMono;
-  // Output block of step n covers input times [S-5160, S-1960) with S = 3200*(n+1), so the first
-  // output sample corresponds to input time -1960: trim this many samples to time-align file output.
-  KnnVcEngine.ALIGN_TRIM_SAMPLES = 1960;
+  // With RW=5, output lags by an extra 2*320=640 samples compared to RW=3 (1960 + 640 = 2600).
+  KnnVcEngine.ALIGN_TRIM_SAMPLES = 2600;
   window.KnnVcEngine = KnnVcEngine;
 })();
