@@ -208,11 +208,10 @@ class VCTrainer:
             base_smooth_loss = (src_base[:, :, 1:] - src_base[:, :, :-1]).pow(2).mean()
         else:
             base_smooth_loss = pred_f0.sum() * 0.0
-        f0_loss = f0_l1 + 0.7 * f0_delta_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 12.0 * base_smooth_loss
+        f0_loss = f0_l1 + 0.7 * f0_delta_l1 + 0.5 * uv_bce + 5.0 * base_f0_loss + 12.0 * base_smooth_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
-        content_in = 0.5 * content_clean + 0.5 * content_feat
-        cond_feat = content_in + f0_feat
+        cond_feat = content_feat + f0_feat
         fd = self.model.core.flow_decoder
         vtl_shift = (
             pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
@@ -276,7 +275,7 @@ class VCTrainer:
                 )
                 pred_mel_shuf, _ = fd.forward_euler_streaming(
                     noise,
-                    content_in + f0_feat_shuf,
+                    content_feat + f0_feat_shuf,
                     spk_shuf,
                     flow_cache,
                     num_steps=self.model.core.num_flow_steps,
@@ -329,9 +328,9 @@ class VCTrainer:
 
             cross_env_loss = (
                 (pred_shape_shuf - tgt_shape_shuf).abs().mean()
-                + 0.8 * target_spk_sim
-                + 0.6 * src_repel
-                + 0.6 * content_cycle
+                + 1.4 * target_spk_sim
+                + 1.2 * src_repel
+                + 0.8 * content_cycle
                 + 0.4 * energy_loss
                 + 0.4 * sharp_loss
             )
@@ -378,17 +377,17 @@ class VCTrainer:
         vocoder_loss = stft_loss + 1.5 * voc_mel_loss
 
         total_loss = (
-            1.5 * rf_loss
+            1.2 * rf_loss
             + 0.5 * cm_loss
-            + 2.5 * mel_l1_loss
-            + 0.3 * content_inv_loss
+            + 1.2 * mel_l1_loss
+            + 0.4 * content_inv_loss
             + 0.5 * content_var_loss
             + 0.10 * content_bias_loss
             + 2.0 * ssl_distill_loss
             + 1.0 * f0_loss
             + 0.6 * spk_loss
             + 0.5 * mel_spk_loss
-            + 0.5 * cross_env_loss
+            + 2.0 * cross_env_loss
             + vocoder_loss
         )
 

@@ -205,7 +205,7 @@ class CausalPitchConditioner(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Estimate F0 causally via harmonic comb + ConvNeXt smoothing, adapt register, and embed."""
         sal = torch.matmul(self.comb_bank, torch.log(torch.clamp(mag, min=1e-3)))
-        comb_probs = F.softmax(sal * 12.0, dim=1)
+        comb_probs = F.softmax(sal * 35.0, dim=1)
         comb_log_f0 = (comb_probs * self.log_f0_cands).sum(dim=1, keepdim=True)
         max_sal, _ = sal.max(dim=1, keepdim=True)
         low_band_energy = mag[:, 2:60, :].mean(dim=1, keepdim=True)

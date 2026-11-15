@@ -141,6 +141,8 @@
     totalChunks: 0,
     isRecordingRef: false,
     isConvertingFile: false,
+    fileAbort: false,
+    filePlayCtx: null,
     fileOutputUrl: null,
   };
 
@@ -164,6 +166,7 @@
     btnBypass: document.getElementById("btn-bypass"),
     btnResetCache: document.getElementById("btn-reset-cache"),
     srcFileInput: document.getElementById("src-file-input"),
+    btnStopFileVc: document.getElementById("btn-stop-file-vc"),
     fileVcStatus: document.getElementById("file-vc-status"),
     fileVcOutput: document.getElementById("file-vc-output"),
     fileVcPlayer: document.getElementById("file-vc-player"),
@@ -501,6 +504,17 @@
     return new Blob([buffer], { type: "audio/wav" });
   }
 
+  async function stopFilePlayback() {
+    state.fileAbort = true;
+    if (state.filePlayCtx) {
+      try {
+        await state.filePlayCtx.close();
+      } catch (_) {}
+      state.filePlayCtx = null;
+    }
+    el.btnStopFileVc.hidden = true;
+  }
+
   async function handleSourceFileConvert(file) {
     if (!file || !state.modelsReady || state.isConvertingFile) return;
     if (state.isStreaming) {
@@ -508,8 +522,10 @@
     }
 
     state.isConvertingFile = true;
+    state.fileAbort = false;
     el.srcFileInput.disabled = true;
-    el.fileVcStatus.textContent = `変換中: ${file.name}...`;
+    el.btnStopFileVc.hidden = false;
+    el.fileVcStatus.textContent = `デコード中: ${file.name}...`;
 
     try {
       log(`変換元ファイルをデコード中: ${file.name}`);
@@ -519,25 +535,38 @@
       }
       state.cacheManager.reset();
 
+      const playCtx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+      state.filePlayCtx = playCtx;
+      if (playCtx.state === "suspended") {
+        await playCtx.resume();
+      }
+
       const totalChunks = Math.ceil(mono24k.length / CHUNK_SAMPLES);
       const outRaw = new Float32Array(totalChunks * CHUNK_SAMPLES);
       const chunkBuf = new Float32Array(CHUNK_SAMPLES);
       let inferTotalMs = 0;
+      let playedChunks = 0;
+      let nextPlayTime = playCtx.currentTime + 0.06;
 
       for (let idx = 0; idx < totalChunks; idx++) {
+        if (state.fileAbort) break;
+
         const start = idx * CHUNK_SAMPLES;
         const end = Math.min(mono24k.length, start + CHUNK_SAMPLES);
         chunkBuf.fill(0);
         chunkBuf.set(mono24k.subarray(start, end));
 
         const inputRms = computeRms(chunkBuf);
+        let playSamples;
         if (state.bypass) {
-          outRaw.set(chunkBuf, start);
+          playSamples = new Float32Array(chunkBuf);
+          outRaw.set(playSamples, start);
           el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
           el.meterOut.style.width = `${Math.min(100, inputRms * 350)}%`;
-          drawWaveforms(chunkBuf, chunkBuf);
+          drawWaveforms(chunkBuf, playSamples);
         } else {
           const { outChunk, inferMs } = await runStreamingChunk(chunkBuf);
+          playSamples = outChunk;
           outRaw.set(outChunk, start);
           inferTotalMs += inferMs;
           const outRms = computeRms(outChunk);
@@ -547,35 +576,77 @@
           el.perfRtf.textContent = (inferMs / 40.0).toFixed(3);
           drawWaveforms(chunkBuf, outChunk);
         }
-        el.fileVcStatus.textContent = `変換中 (${idx + 1}/${totalChunks})...`;
+
+        if (state.fileAbort) break;
+        const audioBuf = playCtx.createBuffer(1, CHUNK_SAMPLES, SAMPLE_RATE);
+        audioBuf.copyToChannel(playSamples, 0);
+        const srcNode = playCtx.createBufferSource();
+        srcNode.buffer = audioBuf;
+        srcNode.connect(playCtx.destination);
+        const now = playCtx.currentTime;
+        if (nextPlayTime < now) {
+          nextPlayTime = now + 0.02;
+        }
+        srcNode.start(nextPlayTime);
+        nextPlayTime += CHUNK_SAMPLES / SAMPLE_RATE;
+        playedChunks = idx + 1;
+
+        el.fileVcStatus.textContent = `リアルタイム再生中 (${playedChunks}/${totalChunks})...`;
+
+        // Pace streaming so pitch slider & bypass changes take effect in real time
+        while (!state.fileAbort && nextPlayTime - playCtx.currentTime > 0.20) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
       }
 
-      // Trim 720-sample causal STFT/OLA synthesis delay so output aligns cleanly
-      const delay = state.bypass ? 0 : Math.min(720, outRaw.length);
-      const trimmed = outRaw.subarray(delay, Math.min(outRaw.length, delay + mono24k.length));
-      const wavBlob = encodeWavBlob(trimmed, SAMPLE_RATE);
-
-      if (state.fileOutputUrl) {
-        URL.revokeObjectURL(state.fileOutputUrl);
+      if (!state.fileAbort) {
+        const remainMs = Math.max(0, (nextPlayTime - playCtx.currentTime) * 1000);
+        if (remainMs > 0) {
+          await new Promise((r) => setTimeout(r, Math.min(remainMs + 40, 1000)));
+        }
       }
-      state.fileOutputUrl = URL.createObjectURL(wavBlob);
-      el.fileVcPlayer.src = state.fileOutputUrl;
-      el.fileVcDownload.href = state.fileOutputUrl;
-      const baseName = file.name.replace(/\.[^.]+$/, "");
-      el.fileVcDownload.download = `${baseName}_converted.wav`;
-      el.fileVcOutput.hidden = false;
 
-      const avgMs = totalChunks > 0 ? inferTotalMs / totalChunks : 0;
+      if (state.filePlayCtx === playCtx) {
+        try {
+          await playCtx.close();
+        } catch (_) {}
+        state.filePlayCtx = null;
+      }
+
+      if (playedChunks > 0) {
+        const delay = state.bypass ? 0 : Math.min(720, playedChunks * CHUNK_SAMPLES);
+        const validEnd = Math.min(playedChunks * CHUNK_SAMPLES, delay + mono24k.length);
+        const trimmed = outRaw.subarray(delay, Math.max(delay, validEnd));
+        const wavBlob = encodeWavBlob(trimmed, SAMPLE_RATE);
+
+        if (state.fileOutputUrl) {
+          URL.revokeObjectURL(state.fileOutputUrl);
+        }
+        state.fileOutputUrl = URL.createObjectURL(wavBlob);
+        el.fileVcPlayer.src = state.fileOutputUrl;
+        el.fileVcDownload.href = state.fileOutputUrl;
+        const baseName = file.name.replace(/\.[^.]+$/, "");
+        el.fileVcDownload.download = `${baseName}_converted.wav`;
+        el.fileVcOutput.hidden = false;
+      }
+
+      const avgMs = playedChunks > 0 ? inferTotalMs / playedChunks : 0;
       const durSec = mono24k.length / SAMPLE_RATE;
-      el.fileVcStatus.textContent = `完了: ${file.name} (${durSec.toFixed(2)}秒 / 平均 ${avgMs.toFixed(1)} ms)`;
-      log(`ファイル変換完了 [${file.name}]: ${totalChunks}チャンク, 平均 ${avgMs.toFixed(2)} ms (RTF ${(avgMs / 40.0).toFixed(3)})`);
+      el.fileVcStatus.textContent = state.fileAbort
+        ? `停止: ${file.name} (${playedChunks}/${totalChunks}チャンク)`
+        : `再生完了: ${file.name} (${durSec.toFixed(2)}秒 / 平均 ${avgMs.toFixed(1)} ms)`;
+      log(`ファイルリアルタイム再生${state.fileAbort ? "停止" : "完了"} [${file.name}]: ${playedChunks}チャンク, 平均 ${avgMs.toFixed(2)} ms`);
     } catch (err) {
-      el.fileVcStatus.textContent = `変換エラー: ${err.message}`;
-      log(`ファイル変換エラー: ${err.message}`);
+      el.fileVcStatus.textContent = `再生エラー: ${err.message}`;
+      log(`ファイル再生エラー: ${err.message}`);
     } finally {
       state.isConvertingFile = false;
+      state.fileAbort = false;
+      el.btnStopFileVc.hidden = true;
       el.srcFileInput.disabled = false;
       el.srcFileInput.value = "";
+      el.meterIn.style.width = "0%";
+      el.meterOut.style.width = "0%";
     }
   }
 
@@ -835,6 +906,10 @@
   el.srcFileInput.addEventListener("change", (ev) => {
     const file = ev.target.files && ev.target.files[0];
     if (file) handleSourceFileConvert(file);
+  });
+
+  el.btnStopFileVc.addEventListener("click", () => {
+    stopFilePlayback();
   });
 
   el.btnRecordRef.addEventListener("click", () => {
