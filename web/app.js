@@ -626,13 +626,15 @@
       }
 
       const totalChunks = Math.ceil(srcAudio.length / chunkLen);
+      const chunkMs = (chunkLen / playRate) * 1000;
       const outRaw = new Float32Array(totalChunks * chunkLen);
       const chunkBuf = new Float32Array(chunkLen);
       let inferTotalMs = 0;
       let playedChunks = 0;
-      // Pre-buffer initial chunks before starting audio clock so inference latency never causes initial underrun
-      const prebufferCount = Math.min(totalChunks, isKnn ? 3 : 2);
+      // Dynamically adjust pre-buffer size from measured inference speed so playback never underruns mid-file
+      let targetPrebuffer = Math.min(totalChunks, state.bypass ? 1 : isKnn ? 3 : 2);
       const prebuffered = [];
+      let playbackStarted = false;
       let nextPlayTime = 0;
 
       const schedulePlay = (samples) => {
@@ -694,20 +696,31 @@
 
         if (state.fileAbort) break;
         playedChunks = idx + 1;
-        if (idx < prebufferCount - 1) {
+
+        if (!playbackStarted) {
+          if (!state.bypass && playedChunks >= 2) {
+            const avgMs = inferTotalMs / playedChunks;
+            const effMs = avgMs * 1.15;
+            if (effMs > chunkMs) {
+              const needed = Math.ceil(totalChunks * (1 - chunkMs / effMs)) + 2;
+              targetPrebuffer = Math.min(totalChunks, Math.max(targetPrebuffer, needed));
+            }
+          }
           prebuffered.push(playSamples);
-          el.fileVcStatus.textContent = `先読みバッファ中 (${playedChunks}/${prebufferCount})...`;
-          continue;
-        }
-        if (prebuffered.length > 0) {
+          if (playedChunks < targetPrebuffer) {
+            el.fileVcStatus.textContent = `先読み変換中 (${playedChunks}/${targetPrebuffer})...`;
+            continue;
+          }
+          playbackStarted = true;
           for (const buf of prebuffered) schedulePlay(buf);
           prebuffered.length = 0;
+        } else {
+          schedulePlay(playSamples);
         }
-        schedulePlay(playSamples);
 
         el.fileVcStatus.textContent = `リアルタイム再生中 (${playedChunks}/${totalChunks})...`;
 
-        const maxAhead = isKnn ? 1.20 : 0.30;
+        const maxAhead = isKnn ? 2.0 : 0.40;
         while (!state.fileAbort && nextPlayTime - playCtx.currentTime > maxAhead) {
           await new Promise((r) => setTimeout(r, 25));
         }
