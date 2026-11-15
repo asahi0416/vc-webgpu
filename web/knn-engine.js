@@ -22,11 +22,11 @@
   const OVERLAP = 320; // 20 ms Hann crossfade across 200 ms chunks
   const DIM = 1024;
   const TOPK = 4;
-  const TEMP_WEIGHT = 20.0;
-  const CONT_BONUS = 0.04;
-  const CENTER_ALPHA = 0.5;
-  const GATE_LOW = 0.001;
-  const GATE_HIGH = 0.003;
+  const TEMP_WEIGHT = 15.0;
+  const CONT_BONUS = 0.0;
+  const CENTER_ALPHA = 0.0;
+  const GATE_LOW = 0.005;
+  const GATE_HIGH = 0.015;
   const CHUNK = HF * HOP; // 3200 samples = 200 ms
   const REF_EMIT = 40; // frames emitted per reference window
   const MAX_REF_SECONDS = 60;
@@ -499,6 +499,7 @@
 
       const t0 = performance.now();
       const j0 = WIN_FRAMES - RW - HF;
+      const usePsola = Math.abs(this.pitchSemitones) >= 0.1;
       for (let k = 0; k < HF; k++) {
         const st = (j0 + k) * HOP;
         let sq = 0;
@@ -508,11 +509,16 @@
         }
         const frameRms = Math.sqrt(sq / 400);
         this.rmsFifo.push(frameRms);
-        const f0St = Math.max(0, st - 100);
-        const sf = fastNsdfF0(this.hist, f0St, 560, SR, 75, 700, this.prevSrcF0);
-        if (sf.f0 > 0) this.prevSrcF0 = sf.f0;
-        this.srcF0Fifo.push(sf.f0);
-        this.srcConfFifo.push(sf.conf);
+        if (usePsola) {
+          const f0St = Math.max(0, st - 100);
+          const sf = fastNsdfF0(this.hist, f0St, 560, SR, 75, 700, this.prevSrcF0);
+          if (sf.f0 > 0) this.prevSrcF0 = sf.f0;
+          this.srcF0Fifo.push(sf.f0);
+          this.srcConfFifo.push(sf.conf);
+        } else {
+          this.srcF0Fifo.push(0);
+          this.srcConfFifo.push(0);
+        }
         const q = feat.subarray((j0 + k) * DIM, (j0 + k + 1) * DIM);
         this.matched.push(this._matchFrame(q, frameRms));
       }
@@ -534,30 +540,34 @@
       const wav = await this._vocode(flat);
       const s0 = LC * HOP;
 
-      // Formant-preserving TD-PSOLA pitch matching to source F0 (+ user pitch shift)
-      const nFrOut = HF + 1;
-      const f0OutArr = new Float32Array(nFrOut);
-      const confOutArr = new Float32Array(nFrOut);
-      const f0TgtArr = new Float32Array(nFrOut);
-      const confTgtArr = new Float32Array(nFrOut);
-      const pitchMul = Math.pow(2, this.pitchSemitones / 12);
-      const firstF0 = this.srcF0Fifo[0];
-      const firstConf = this.srcConfFifo[0];
-      for (let k = 0; k < nFrOut; k++) {
-        const idx = LC + k;
-        const sf = idx < pad ? firstF0 : idx - pad < this.srcF0Fifo.length ? this.srcF0Fifo[idx - pad] : this.srcF0Fifo[this.srcF0Fifo.length - 1];
-        const sc = idx < pad ? firstConf : idx - pad < this.srcConfFifo.length ? this.srcConfFifo[idx - pad] : this.srcConfFifo[this.srcConfFifo.length - 1];
-        f0TgtArr[k] = sf > 0 ? sf * pitchMul : 0;
-        confTgtArr[k] = sc;
-        const cst = Math.max(0, s0 + k * HOP - 100);
-        const lenO = Math.min(560, wav.length - cst);
-        const of = lenO >= 400 ? fastNsdfF0(wav, cst, lenO, SR, 75, 700, this.prevOutF0) : { f0: 0, conf: 0 };
-        if (of.f0 > 0) this.prevOutF0 = of.f0;
-        f0OutArr[k] = of.f0;
-        confOutArr[k] = of.conf;
+      let seg;
+      if (usePsola) {
+        // Formant-preserving TD-PSOLA pitch shift when user adjusts #pitch-shift
+        const nFrOut = HF + 1;
+        const f0OutArr = new Float32Array(nFrOut);
+        const confOutArr = new Float32Array(nFrOut);
+        const f0TgtArr = new Float32Array(nFrOut);
+        const confTgtArr = new Float32Array(nFrOut);
+        const pitchMul = Math.pow(2, this.pitchSemitones / 12);
+        const firstF0 = this.srcF0Fifo[0];
+        const firstConf = this.srcConfFifo[0];
+        for (let k = 0; k < nFrOut; k++) {
+          const idx = LC + k;
+          const sf = idx < pad ? firstF0 : idx - pad < this.srcF0Fifo.length ? this.srcF0Fifo[idx - pad] : this.srcF0Fifo[this.srcF0Fifo.length - 1];
+          const sc = idx < pad ? firstConf : idx - pad < this.srcConfFifo.length ? this.srcConfFifo[idx - pad] : this.srcConfFifo[this.srcConfFifo.length - 1];
+          f0TgtArr[k] = sf > 0 ? sf * pitchMul : 0;
+          confTgtArr[k] = sc;
+          const cst = Math.max(0, s0 + k * HOP - 100);
+          const lenO = Math.min(560, wav.length - cst);
+          const of = lenO >= 400 ? fastNsdfF0(wav, cst, lenO, SR, 75, 700, this.prevOutF0) : { f0: 0, conf: 0 };
+          if (of.f0 > 0) this.prevOutF0 = of.f0;
+          f0OutArr[k] = of.f0;
+          confOutArr[k] = of.conf;
+        }
+        seg = tdPsolaChunk(wav, s0, CHUNK + OVERLAP, f0OutArr, confOutArr, f0TgtArr, confTgtArr, 320, 320);
+      } else {
+        seg = wav.subarray(s0, s0 + CHUNK + OVERLAP).slice();
       }
-
-      const seg = tdPsolaChunk(wav, s0, CHUNK + OVERLAP, f0OutArr, confOutArr, f0TgtArr, confTgtArr, 320, 320);
       if (this.prevTail) {
         for (let i = 0; i < OVERLAP; i++) {
           const a = 0.5 * (1 - Math.cos((Math.PI * i) / OVERLAP));
@@ -572,7 +582,7 @@
       for (let k = 0; k < HF; k++) {
         const idx = LC + k;
         const rk = idx < pad ? firstRms : this.rmsFifo[idx - pad];
-        const gate = Math.min(1.0, Math.max(0.02, (rk - GATE_LOW) / (GATE_HIGH - GATE_LOW)));
+        const gate = Math.min(1.0, Math.max(0.0, (rk - GATE_LOW) / (GATE_HIGH - GATE_LOW)));
         const scale = g * gate;
         const base = k * HOP;
         for (let i = 0; i < HOP; i++) {
