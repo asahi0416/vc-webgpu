@@ -1019,6 +1019,9 @@
 
   function updatePitch(val) {
     state.pitchShift = parseFloat(val);
+    if (state.knnEngine && typeof state.knnEngine.setPitchShift === "function") {
+      state.knnEngine.setPitchShift(state.pitchShift);
+    }
     el.pitchSlider.value = String(state.pitchShift);
     const sign = state.pitchShift >= 0 ? "+" : "";
     el.pitchValue.textContent = `${sign}${state.pitchShift.toFixed(1)} st`;
