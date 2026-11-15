@@ -282,7 +282,7 @@ class CausalVocosVocoder(nn.Module):
 
         spec_params = self.head(self.out_norm(h))
         raw_env, raw_disp = torch.chunk(spec_params, 2, dim=1)
-        delta_env = 1.2 * torch.tanh(raw_env)
+        delta_env = 2.5 * torch.tanh(raw_env)
         base_log_env = torch.matmul(self.mel_lifter, mel - self.log_fb_sum)
         filt_log_mag = base_log_env + delta_env
         # Keep harmonics clean up to ~5.2 kHz while tapering Nyquist harmonics gently

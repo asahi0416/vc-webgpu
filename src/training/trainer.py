@@ -79,8 +79,11 @@ class VCTrainer:
         self.model = model.to(device)
         self.device = torch.device(device)
         # Training-only projection head for ContentVec causal distillation (not exported to ONNX)
-        self.ssl_proj = nn.Conv1d(
-            model.core.content_encoder.dim, 768, kernel_size=1
+        ce_dim = model.core.content_encoder.dim
+        self.ssl_proj = nn.Sequential(
+            nn.Conv1d(ce_dim, ce_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(ce_dim, 768, kernel_size=1),
         ).to(self.device)
         self.optimizer = torch.optim.AdamW(
             list(self.model.parameters()) + list(self.ssl_proj.parameters()),
@@ -208,7 +211,8 @@ class VCTrainer:
         f0_loss = f0_l1 + 0.7 * f0_delta_l1 + 0.5 * uv_bce + 2.0 * base_f0_loss + 12.0 * base_smooth_loss
 
         # 4. Rectified Flow Matching + Consistency + 2-step Euler reconstruction losses
-        cond_feat = content_feat + f0_feat
+        content_in = 0.5 * content_clean + 0.5 * content_feat
+        cond_feat = content_in + f0_feat
         fd = self.model.core.flow_decoder
         vtl_shift = (
             pc.last_tgt_base_log_f0 - pc.last_src_base_log_f0
@@ -236,10 +240,19 @@ class VCTrainer:
             num_steps=self.model.core.num_flow_steps,
             base_mel=base_mel,
         )
+        temp_delta_loss = (
+            F.l1_loss(
+                pred_mel[:, :, 1:] - pred_mel[:, :, :-1],
+                (tgt_mel[:, :, 1:] - tgt_mel[:, :, :-1]).detach(),
+            )
+            if pred_mel.shape[-1] > 1
+            else pred_mel.sum() * 0.0
+        )
         mel_l1_loss = (
             F.l1_loss(pred_mel, tgt_mel)
             + 0.6 * F.l1_loss(_hp15_formants(pred_mel), _hp15_formants(tgt_mel).detach())
             + 0.4 * F.l1_loss(pred_mel.std(dim=1), tgt_mel.std(dim=1).detach())
+            + 0.8 * temp_delta_loss
         )
 
         # Cross-speaker shuffled neural speaker similarity + content consistency + envelope loss
@@ -263,7 +276,7 @@ class VCTrainer:
                 )
                 pred_mel_shuf, _ = fd.forward_euler_streaming(
                     noise,
-                    content_feat + f0_feat_shuf,
+                    content_in + f0_feat_shuf,
                     spk_shuf,
                     flow_cache,
                     num_steps=self.model.core.num_flow_steps,
@@ -330,7 +343,7 @@ class VCTrainer:
         voc_cache = torch.zeros(voc.num_layers, batch_size, voc.dim, voc.pad_len, device=self.device)
         ola_cache = torch.zeros(batch_size, STFT_CACHE_LEN, device=self.device)
 
-        voc_in_mel = 0.5 * tgt_mel.detach() + 0.5 * pred_mel.detach()
+        voc_in_mel = 0.85 * tgt_mel.detach() + 0.15 * pred_mel.detach()
         pred_audio, _, _ = voc(
             voc_in_mel,
             spk_emb,
@@ -362,16 +375,16 @@ class VCTrainer:
             voc_mel_loss = F.l1_loss(pred_out_mel, tgt_out_mel)
         else:
             voc_mel_loss = aligned_pred.sum() * 0.0
-        vocoder_loss = stft_loss + 0.5 * voc_mel_loss
+        vocoder_loss = stft_loss + 1.5 * voc_mel_loss
 
         total_loss = (
-            rf_loss
+            1.5 * rf_loss
             + 0.5 * cm_loss
-            + 0.8 * mel_l1_loss
-            + 0.6 * content_inv_loss
-            + 0.8 * content_var_loss
-            + 0.15 * content_bias_loss
-            + 1.5 * ssl_distill_loss
+            + 2.5 * mel_l1_loss
+            + 0.3 * content_inv_loss
+            + 0.5 * content_var_loss
+            + 0.10 * content_bias_loss
+            + 2.0 * ssl_distill_loss
             + 1.0 * f0_loss
             + 0.6 * spk_loss
             + 0.5 * mel_spk_loss
