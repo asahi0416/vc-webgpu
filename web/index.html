@@ -26,7 +26,11 @@
           <span id="status-model">モデル読込中...</span>
         </div>
         <div class="pill pill-spec">
-          <span>24kHz / 40ms Chunk (960 smp)</span>
+          <label for="engine-select" style="margin-right:6px;">Engine:</label>
+          <select id="engine-select" style="background:transparent;color:inherit;border:none;font:inherit;cursor:pointer;outline:none;">
+            <option value="knn" selected style="background:#0f172a;color:#f8fafc;">kNN-VC (WavLM+HiFi-GAN 16kHz / ~500ms)</option>
+            <option value="flow" style="background:#0f172a;color:#f8fafc;">Causal FlowVC (24kHz / 40ms)</option>
+          </select>
         </div>
       </div>
     </header>
@@ -181,6 +185,7 @@
     </main>
   </div>
 
+  <script src="/web/knn-engine.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>

@@ -6,3 +6,5 @@ checkpoints/*.pt
 data/
 .venv/
 venv/
+third_party/
+models/knn/

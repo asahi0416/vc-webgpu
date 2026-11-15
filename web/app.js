@@ -122,6 +122,9 @@
   }
 
   const state = {
+    engine: "knn",
+    knnEngine: null,
+    knnReady: false,
     backendName: "unknown",
     speakerSession: null,
     coreSession: null,
@@ -148,6 +151,7 @@
 
   // DOM Elements
   const el = {
+    engineSelect: document.getElementById("engine-select"),
     dotBackend: document.getElementById("dot-backend"),
     statusBackend: document.getElementById("status-backend"),
     dotModel: document.getElementById("dot-model"),
@@ -253,7 +257,35 @@
     plotLine(outArr, "#10b981", h * 0.72, h * 0.25);
   }
 
+  function activeModelsReady() {
+    return state.engine === "knn" ? state.knnReady : state.modelsReady;
+  }
+
+  function hasReferenceReady() {
+    if (state.engine === "knn") {
+      return Boolean(state.knnEngine && state.knnEngine.nRef > 0);
+    }
+    return Boolean(state.spkEmbData);
+  }
+
   async function extractSpeakerEmbedding(float32Audio, label = "参照音声", updateUi = true) {
+    if (state.engine === "knn") {
+      if (!state.knnReady || !state.knnEngine) {
+        throw new Error("kNN-VC モデルがまだロードされていません。");
+      }
+      if (updateUi) el.refStatus.textContent = "kNN 特徴抽出中...";
+      const res = await state.knnEngine.setReference(float32Audio, SAMPLE_RATE, (w, tot) => {
+        if (updateUi) el.refStatus.textContent = `kNN 特徴抽出中 (${w}/${tot})...`;
+      });
+      if (updateUi) {
+        el.refStatus.textContent = `${label} (${res.seconds.toFixed(1)}秒 / ${res.frames}fr)`;
+        el.refTime.textContent = `${res.buildMs.toFixed(1)} ms`;
+        el.refNorm.textContent = `${res.frames} fr`;
+        log(`kNN参照抽出完了 [${label}]: ${res.frames}フレーム (${res.seconds.toFixed(1)}秒, ${res.buildMs.toFixed(0)} ms)`);
+      }
+      return null;
+    }
+
     if (!state.modelsReady || !state.speakerSession) {
       throw new Error("モデルがまだロードされていません。");
     }
@@ -410,28 +442,66 @@
     state.modelsReady = true;
   }
 
+  function configureOrtEnv() {
+    if (typeof window.ort === "undefined") {
+      throw new Error("ONNX Runtime Web (ort) が読み込まれていません。");
+    }
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+    ort.env.wasm.numThreads = window.crossOriginIsolated
+      ? Math.min(4, navigator.hardwareConcurrency || 2)
+      : 1;
+  }
+
+  async function initKnnModels() {
+    configureOrtEnv();
+    if (!state.knnEngine) {
+      state.knnEngine = new window.KnnVcEngine();
+    }
+    if (!state.knnReady) {
+      await state.knnEngine.load(ort, (msg) => {
+        el.statusModel.textContent = msg;
+        log(`[kNN-VC] ${msg}`);
+      });
+      state.knnReady = true;
+    }
+    state.backendName = `WASM ${ort.env.wasm.numThreads}T (kNN-VC)`;
+  }
+
+  function setControlsEnabled(enabled) {
+    el.btnRecordRef.disabled = !enabled;
+    el.btnTestRef.disabled = !enabled;
+    el.btnToggleVc.disabled = !enabled;
+    el.btnBypass.disabled = !enabled;
+    el.btnResetCache.disabled = !enabled;
+    el.srcFileInput.disabled = !enabled;
+    el.btnRunBench.disabled = !enabled;
+  }
+
   async function initModels() {
+    setControlsEnabled(false);
     try {
+      el.dotBackend.className = "dot";
+      el.dotModel.className = "dot";
       el.statusBackend.textContent = "バックエンド検証中...";
       el.statusModel.textContent = "ONNXモデル読込中...";
-      await detectAndCreateSessions();
+
+      if (state.engine === "knn") {
+        await initKnnModels();
+        el.statusModel.textContent = "準備完了 (kNN-VC 16kHz)";
+        log("kNN-VC 初期化完了 (WavLM-int8 127MB + HiFi-GAN 66MB)");
+      } else {
+        await detectAndCreateSessions();
+        el.statusModel.textContent = "準備完了 (FlowVC 24kHz)";
+        log(`FlowVC 初期化完了 (${state.backendName}) — Total ONNX ~39MB`);
+      }
 
       el.dotBackend.className = "dot ok";
       el.statusBackend.textContent = `Backend: ${state.backendName}`;
       el.dotModel.className = "dot ok";
-      el.statusModel.textContent = "準備完了 (Ready)";
 
-      el.btnRecordRef.disabled = false;
-      el.btnTestRef.disabled = false;
-      el.btnToggleVc.disabled = false;
-      el.btnBypass.disabled = false;
-      el.btnResetCache.disabled = false;
-      el.srcFileInput.disabled = false;
-      el.fileVcStatus.textContent = "音声ファイル (.mp3 / .wav 等) を選択して変換";
-      el.btnRunBench.disabled = false;
+      setControlsEnabled(true);
+      el.fileVcStatus.textContent = "音声ファイル (.mp3 / .wav 等) を選択してリアルタイム再生";
       el.benchStatus.textContent = `${state.backendName} でベンチマーク実行可能です。`;
-
-      log(`初期化完了 (${state.backendName}) — Total ONNX ~38.6MB`);
     } catch (err) {
       el.dotBackend.className = "dot err";
       el.dotModel.className = "dot err";
@@ -516,7 +586,7 @@
   }
 
   async function handleSourceFileConvert(file) {
-    if (!file || !state.modelsReady || state.isConvertingFile) return;
+    if (!file || !activeModelsReady() || state.isConvertingFile) return;
     if (state.isStreaming) {
       await stopRealtimeVC();
     }
@@ -530,31 +600,44 @@
     try {
       log(`変換元ファイルをデコード中: ${file.name}`);
       const mono24k = await decodeAudioFileTo24kMono(file);
-      if (!state.spkEmbData) {
+      if (!hasReferenceReady()) {
         await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
       }
-      state.cacheManager.reset();
 
-      const playCtx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+      const isKnn = state.engine === "knn";
+      const playRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
+      const chunkLen = isKnn ? window.KnnVcEngine.CHUNK : CHUNK_SAMPLES;
+      const alignTrim = isKnn ? window.KnnVcEngine.ALIGN_TRIM_SAMPLES : 720;
+      const srcAudio = isKnn
+        ? await window.KnnVcEngine.resampleMono(mono24k, SAMPLE_RATE, playRate)
+        : mono24k;
+
+      if (isKnn) {
+        state.knnEngine.reset();
+      } else {
+        state.cacheManager.reset();
+      }
+
+      const playCtx = new AudioContext({ sampleRate: playRate, latencyHint: "interactive" });
       state.filePlayCtx = playCtx;
       if (playCtx.state === "suspended") {
         await playCtx.resume();
       }
 
-      const totalChunks = Math.ceil(mono24k.length / CHUNK_SAMPLES);
-      const outRaw = new Float32Array(totalChunks * CHUNK_SAMPLES);
-      const chunkBuf = new Float32Array(CHUNK_SAMPLES);
+      const totalChunks = Math.ceil(srcAudio.length / chunkLen);
+      const outRaw = new Float32Array(totalChunks * chunkLen);
+      const chunkBuf = new Float32Array(chunkLen);
       let inferTotalMs = 0;
       let playedChunks = 0;
-      let nextPlayTime = playCtx.currentTime + 0.06;
+      let nextPlayTime = playCtx.currentTime + (isKnn ? 0.12 : 0.06);
 
       for (let idx = 0; idx < totalChunks; idx++) {
         if (state.fileAbort) break;
 
-        const start = idx * CHUNK_SAMPLES;
-        const end = Math.min(mono24k.length, start + CHUNK_SAMPLES);
+        const start = idx * chunkLen;
+        const end = Math.min(srcAudio.length, start + chunkLen);
         chunkBuf.fill(0);
-        chunkBuf.set(mono24k.subarray(start, end));
+        chunkBuf.set(srcAudio.subarray(start, end));
 
         const inputRms = computeRms(chunkBuf);
         let playSamples;
@@ -565,7 +648,19 @@
           el.meterOut.style.width = `${Math.min(100, inputRms * 350)}%`;
           drawWaveforms(chunkBuf, playSamples);
         } else {
-          const { outChunk, inferMs } = await runStreamingChunk(chunkBuf);
+          let outChunk;
+          let inferMs;
+          if (isKnn) {
+            const t0 = performance.now();
+            outChunk = await state.knnEngine.processChunk(chunkBuf);
+            inferMs = performance.now() - t0;
+            state.totalChunks += 1;
+            el.perfChunks.textContent = String(state.totalChunks);
+          } else {
+            const res = await runStreamingChunk(chunkBuf);
+            outChunk = res.outChunk;
+            inferMs = res.inferMs;
+          }
           playSamples = outChunk;
           outRaw.set(outChunk, start);
           inferTotalMs += inferMs;
@@ -573,12 +668,12 @@
           el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
           el.meterOut.style.width = `${Math.min(100, outRms * 350)}%`;
           el.perfAvgMs.textContent = `${inferMs.toFixed(2)} ms`;
-          el.perfRtf.textContent = (inferMs / 40.0).toFixed(3);
+          el.perfRtf.textContent = (inferMs / (isKnn ? 200.0 : 40.0)).toFixed(3);
           drawWaveforms(chunkBuf, outChunk);
         }
 
         if (state.fileAbort) break;
-        const audioBuf = playCtx.createBuffer(1, CHUNK_SAMPLES, SAMPLE_RATE);
+        const audioBuf = playCtx.createBuffer(1, chunkLen, playRate);
         audioBuf.copyToChannel(playSamples, 0);
         const srcNode = playCtx.createBufferSource();
         srcNode.buffer = audioBuf;
@@ -588,13 +683,13 @@
           nextPlayTime = now + 0.02;
         }
         srcNode.start(nextPlayTime);
-        nextPlayTime += CHUNK_SAMPLES / SAMPLE_RATE;
+        nextPlayTime += chunkLen / playRate;
         playedChunks = idx + 1;
 
         el.fileVcStatus.textContent = `リアルタイム再生中 (${playedChunks}/${totalChunks})...`;
 
-        // Pace streaming so pitch slider & bypass changes take effect in real time
-        while (!state.fileAbort && nextPlayTime - playCtx.currentTime > 0.20) {
+        const maxAhead = isKnn ? 0.50 : 0.20;
+        while (!state.fileAbort && nextPlayTime - playCtx.currentTime > maxAhead) {
           await new Promise((r) => setTimeout(r, 25));
         }
       }
@@ -602,7 +697,7 @@
       if (!state.fileAbort) {
         const remainMs = Math.max(0, (nextPlayTime - playCtx.currentTime) * 1000);
         if (remainMs > 0) {
-          await new Promise((r) => setTimeout(r, Math.min(remainMs + 40, 1000)));
+          await new Promise((r) => setTimeout(r, Math.min(remainMs + 40, 2000)));
         }
       }
 
@@ -614,10 +709,10 @@
       }
 
       if (playedChunks > 0) {
-        const delay = state.bypass ? 0 : Math.min(720, playedChunks * CHUNK_SAMPLES);
-        const validEnd = Math.min(playedChunks * CHUNK_SAMPLES, delay + mono24k.length);
+        const delay = state.bypass ? 0 : Math.min(alignTrim, playedChunks * chunkLen);
+        const validEnd = Math.min(playedChunks * chunkLen, delay + srcAudio.length);
         const trimmed = outRaw.subarray(delay, Math.max(delay, validEnd));
-        const wavBlob = encodeWavBlob(trimmed, SAMPLE_RATE);
+        const wavBlob = encodeWavBlob(trimmed, playRate);
 
         if (state.fileOutputUrl) {
           URL.revokeObjectURL(state.fileOutputUrl);
@@ -631,7 +726,7 @@
       }
 
       const avgMs = playedChunks > 0 ? inferTotalMs / playedChunks : 0;
-      const durSec = mono24k.length / SAMPLE_RATE;
+      const durSec = srcAudio.length / playRate;
       el.fileVcStatus.textContent = state.fileAbort
         ? `停止: ${file.name} (${playedChunks}/${totalChunks}チャンク)`
         : `再生完了: ${file.name} (${durSec.toFixed(2)}秒 / 平均 ${avgMs.toFixed(1)} ms)`;
@@ -713,13 +808,24 @@
     }
 
     state.inferenceBusy = true;
-    runStreamingChunk(chunk)
+    const isKnn = state.engine === "knn";
+    const runPromise = isKnn
+      ? (async () => {
+          const t0 = performance.now();
+          const outChunk = await state.knnEngine.processChunk(chunk);
+          state.totalChunks += 1;
+          el.perfChunks.textContent = String(state.totalChunks);
+          return { outChunk, inferMs: performance.now() - t0 };
+        })()
+      : runStreamingChunk(chunk);
+
+    runPromise
       .then(({ outChunk, inferMs }) => {
         const outRms = computeRms(outChunk);
         el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
         el.meterOut.style.width = `${Math.min(100, outRms * 350)}%`;
         el.perfAvgMs.textContent = `${inferMs.toFixed(2)} ms`;
-        el.perfRtf.textContent = (inferMs / 40.0).toFixed(3);
+        el.perfRtf.textContent = (inferMs / (isKnn ? 200.0 : 40.0)).toFixed(3);
         drawWaveforms(chunk, outChunk);
 
         if (state.workletNode && state.isStreaming) {
@@ -750,26 +856,32 @@
     }
 
     try {
-      if (!state.spkEmbData) {
+      if (!hasReferenceReady()) {
         await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
       }
-      state.cacheManager.reset();
+      const isKnn = state.engine === "knn";
+      if (isKnn) {
+        state.knnEngine.reset();
+      } else {
+        state.cacheManager.reset();
+      }
+      const ctxRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: SAMPLE_RATE,
+          sampleRate: ctxRate,
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
         },
       });
 
-      const ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
-      await ctx.audioWorklet.addModule("/web/vc-audio-worklet.js");
+      const ctx = new AudioContext({ sampleRate: ctxRate, latencyHint: "interactive" });
+      await ctx.audioWorklet.addModule(isKnn ? "/web/knn-audio-worklet.js" : "/web/vc-audio-worklet.js");
 
       const source = ctx.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(ctx, "vc-stream-processor", {
+      const workletNode = new AudioWorkletNode(ctx, isKnn ? "knn-stream-processor" : "vc-stream-processor", {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1],
@@ -834,30 +946,48 @@
   }
 
   async function runBenchmark() {
-    if (!state.modelsReady) return;
+    if (!activeModelsReady()) return;
     el.btnRunBench.disabled = true;
-    el.benchStatus.textContent = "20チャンク連続ベンチマーク実行中...";
+    const isKnn = state.engine === "knn";
+    const totalChunks = isKnn ? 5 : 20;
+    const chunkLen = isKnn ? window.KnnVcEngine.CHUNK : CHUNK_SAMPLES;
+    const benchRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
+    const chunkDurMs = isKnn ? 200.0 : 40.0;
+    el.benchStatus.textContent = `${totalChunks}チャンク連続ベンチマーク実行中...`;
 
     try {
-      if (!state.spkEmbData) {
+      if (!hasReferenceReady()) {
         const ref = generateSyntheticReferenceAudio(REF_SECONDS, 220.0);
         await extractSpeakerEmbedding(ref, "ベンチマークテスト話者");
       }
-      state.cacheManager.reset();
+      if (isKnn) {
+        state.knnEngine.reset();
+      } else {
+        state.cacheManager.reset();
+      }
 
-      const totalChunks = 20;
       const times = [];
       let lastIn = null;
       let lastOut = null;
 
       for (let c = 0; c < totalChunks; c++) {
-        const chunk = new Float32Array(CHUNK_SAMPLES);
-        const phaseOffset = c * CHUNK_SAMPLES;
-        for (let i = 0; i < CHUNK_SAMPLES; i++) {
-          const t = (phaseOffset + i) / SAMPLE_RATE;
+        const chunk = new Float32Array(chunkLen);
+        const phaseOffset = c * chunkLen;
+        for (let i = 0; i < chunkLen; i++) {
+          const t = (phaseOffset + i) / benchRate;
           chunk[i] = 0.3 * Math.sin(2 * Math.PI * 190.0 * t);
         }
-        const { outChunk, inferMs } = await runStreamingChunk(chunk);
+        let outChunk;
+        let inferMs;
+        if (isKnn) {
+          const t0 = performance.now();
+          outChunk = await state.knnEngine.processChunk(chunk);
+          inferMs = performance.now() - t0;
+        } else {
+          const res = await runStreamingChunk(chunk);
+          outChunk = res.outChunk;
+          inferMs = res.inferMs;
+        }
         times.push(inferMs);
         lastIn = chunk;
         lastOut = outChunk;
@@ -866,7 +996,7 @@
       const avg = times.reduce((a, b) => a + b, 0) / times.length;
       const minT = Math.min(...times);
       const maxT = Math.max(...times);
-      const rtf = avg / 40.0;
+      const rtf = avg / chunkDurMs;
 
       el.perfAvgMs.textContent = `${avg.toFixed(2)} ms`;
       el.perfMinMaxMs.textContent = `${minT.toFixed(1)} / ${maxT.toFixed(1)} ms`;
@@ -945,9 +1075,18 @@
   });
 
   el.btnResetCache.addEventListener("click", () => {
+    if (state.knnEngine) state.knnEngine.reset();
     if (state.cacheManager) state.cacheManager.reset();
     if (state.workletNode) state.workletNode.port.postMessage({ type: "reset" });
     log("因果ストリーミングキャッシュをリセットしました。");
+  });
+
+  el.engineSelect.addEventListener("change", async () => {
+    if (state.isStreaming) await stopRealtimeVC();
+    if (state.isConvertingFile) await stopFilePlayback();
+    state.engine = el.engineSelect.value === "flow" ? "flow" : "knn";
+    log(`エンジン切替: ${state.engine === "knn" ? "kNN-VC (WavLM+HiFi-GAN)" : "Causal FlowVC"}`);
+    await initModels();
   });
 
   el.btnRunBench.addEventListener("click", () => {
@@ -955,5 +1094,6 @@
   });
 
   // Boot
+  state.engine = el.engineSelect && el.engineSelect.value === "flow" ? "flow" : "knn";
   initModels();
 })();
