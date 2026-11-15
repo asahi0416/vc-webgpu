@@ -31,7 +31,8 @@
   const REF_EMIT = 40; // frames emitted per reference window
   const MAX_REF_SECONDS = 60;
 
-  const WAVLM_URL = "/models/knn/wavlm6_w1500_int8mm.onnx";
+  const WAVLM_FP32_URL = "/models/knn/wavlm6_w1500.onnx";
+  const WAVLM_INT8_URL = "/models/knn/wavlm6_w1500_int8mm.onnx";
   const HIFIGAN_URL = "/models/knn/hifigan_dyn.onnx";
 
   function trimSilence(x, thrDb) {
@@ -277,6 +278,7 @@
       this.lastMatchMs = 0;
       this.chunkSamples = CHUNK;
       this.sampleRate = SR;
+      this.backendLabel = "WASM";
       this.reset();
     }
 
@@ -285,11 +287,37 @@
     }
 
     async load(ort, onStatus) {
-      const opts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
-      if (onStatus) onStatus("WavLM (int8, 127MB) 読込中...");
-      this.wavlm = await ort.InferenceSession.create(WAVLM_URL, opts);
-      if (onStatus) onStatus("HiFi-GAN (66MB) 読込中...");
-      this.hifigan = await ort.InferenceSession.create(HIFIGAN_URL, opts);
+      let useWebGpu = false;
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (adapter) useWebGpu = true;
+        } catch (_) {}
+      }
+
+      if (useWebGpu) {
+        try {
+          const gpuOpts = { executionProviders: ["webgpu", "wasm"], graphOptimizationLevel: "all" };
+          if (onStatus) onStatus("WavLM (FP32, WebGPU) 読込中...");
+          this.wavlm = await ort.InferenceSession.create(WAVLM_FP32_URL, gpuOpts);
+          if (onStatus) onStatus("HiFi-GAN (WebGPU) 読込中...");
+          this.hifigan = await ort.InferenceSession.create(HIFIGAN_URL, gpuOpts);
+          this.backendLabel = "WebGPU";
+        } catch (err) {
+          console.warn("WebGPU kNN-VC init failed, falling back to WASM int8:", err);
+          useWebGpu = false;
+        }
+      }
+
+      if (!useWebGpu) {
+        const wasmOpts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
+        if (onStatus) onStatus("WavLM (int8, WASM) 読込中...");
+        this.wavlm = await ort.InferenceSession.create(WAVLM_INT8_URL, wasmOpts);
+        if (onStatus) onStatus("HiFi-GAN (WASM) 読込中...");
+        this.hifigan = await ort.InferenceSession.create(HIFIGAN_URL, wasmOpts);
+        this.backendLabel = `WASM ${ort.env.wasm.numThreads}T`;
+      }
+
       this.ort = ort;
       this.ready = true;
       // Warm-up

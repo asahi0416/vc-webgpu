@@ -464,7 +464,7 @@
       });
       state.knnReady = true;
     }
-    state.backendName = `WASM ${ort.env.wasm.numThreads}T (kNN-VC)`;
+    state.backendName = `${state.knnEngine.backendLabel} (kNN-VC)`;
   }
 
   function setControlsEnabled(enabled) {
@@ -488,7 +488,7 @@
       if (state.engine === "knn") {
         await initKnnModels();
         el.statusModel.textContent = "準備完了 (kNN-VC 16kHz)";
-        log("kNN-VC 初期化完了 (WavLM-int8 127MB + HiFi-GAN 66MB)");
+        log(`kNN-VC 初期化完了 (${state.backendName})`);
       } else {
         await detectAndCreateSessions();
         el.statusModel.textContent = "準備完了 (FlowVC 24kHz)";
@@ -632,7 +632,7 @@
       let inferTotalMs = 0;
       let playedChunks = 0;
       // Dynamically adjust pre-buffer size from measured inference speed so playback never underruns mid-file
-      let targetPrebuffer = Math.min(totalChunks, state.bypass ? 1 : isKnn ? 3 : 2);
+      let targetPrebuffer = Math.min(totalChunks, state.bypass ? 1 : 2);
       const prebuffered = [];
       let playbackStarted = false;
       let nextPlayTime = 0;
