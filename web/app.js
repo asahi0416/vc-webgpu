@@ -512,9 +512,12 @@
     }
   }
 
-  async function resampleTo24kMono(audioBuffer) {
-    const targetLen = Math.max(240, Math.ceil(audioBuffer.duration * SAMPLE_RATE));
-    const offline = new OfflineAudioContext(1, targetLen, SAMPLE_RATE);
+  async function resampleBufferToMono(audioBuffer, targetRate) {
+    if (audioBuffer.sampleRate === targetRate && audioBuffer.numberOfChannels === 1) {
+      return audioBuffer.getChannelData(0);
+    }
+    const targetLen = Math.max(240, Math.ceil(audioBuffer.duration * targetRate));
+    const offline = new OfflineAudioContext(1, targetLen, targetRate);
     const src = offline.createBufferSource();
     src.buffer = audioBuffer;
     src.connect(offline.destination);
@@ -523,15 +526,15 @@
     return rendered.getChannelData(0);
   }
 
-  async function decodeAudioFileTo24kMono(file) {
+  async function decodeAudioFileToMono(file, targetRate = SAMPLE_RATE) {
     const arrayBuf = await file.arrayBuffer();
-    const tempCtx = new AudioContext();
-    try {
-      const decoded = await tempCtx.decodeAudioData(arrayBuf);
-      return await resampleTo24kMono(decoded);
-    } finally {
-      await tempCtx.close();
-    }
+    const decodeCtx = new OfflineAudioContext(1, 1, targetRate);
+    const decoded = await decodeCtx.decodeAudioData(arrayBuf);
+    return await resampleBufferToMono(decoded, targetRate);
+  }
+
+  async function decodeAudioFileTo24kMono(file) {
+    return await decodeAudioFileToMono(file, SAMPLE_RATE);
   }
 
   async function handleFileUpload(file) {
@@ -599,18 +602,16 @@
 
     try {
       log(`変換元ファイルをデコード中: ${file.name}`);
-      const mono24k = await decodeAudioFileTo24kMono(file);
-      if (!hasReferenceReady()) {
-        await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
-      }
-
       const isKnn = state.engine === "knn";
       const playRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
       const chunkLen = isKnn ? window.KnnVcEngine.CHUNK : CHUNK_SAMPLES;
       const alignTrim = isKnn ? window.KnnVcEngine.ALIGN_TRIM_SAMPLES : 720;
-      const srcAudio = isKnn
-        ? await window.KnnVcEngine.resampleMono(mono24k, SAMPLE_RATE, playRate)
-        : mono24k;
+
+      const srcAudio = await decodeAudioFileToMono(file, playRate);
+      if (!hasReferenceReady()) {
+        el.fileVcStatus.textContent = "自動参照音声を準備中...";
+        await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
+      }
 
       if (isKnn) {
         state.knnEngine.reset();
