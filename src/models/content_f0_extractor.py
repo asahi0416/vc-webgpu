@@ -38,7 +38,7 @@ class CausalContentEncoder(nn.Module):
         self,
         n_mels: int = N_MELS,
         dim: int = 256,
-        bottleneck_dim: int = 16,
+        bottleneck_dim: int = 48,
         num_layers: int = 3,
         kernel_size: int = 7,
     ) -> None:
@@ -68,7 +68,7 @@ class CausalContentEncoder(nn.Module):
             nn.Conv1d(dim, bottleneck_dim, kernel_size=1),
             nn.Tanh(),
             ChannelLayerNorm(bottleneck_dim),
-            _TrainingBottleneckNoise(noise_std=0.12),
+            _TrainingBottleneckNoise(noise_std=0.05),
             nn.Conv1d(bottleneck_dim, dim, kernel_size=1),
         )
 
@@ -229,8 +229,8 @@ class CausalPitchConditioner(nn.Module):
         pred = self.f0_head(h)  # (B, 3, T)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
         comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
-        # Favor 13-frame causal ConvNeXt temporal estimate over noisy single-frame comb jitter
-        src_log_f0 = src_base_log_f0 + 0.25 * comb_dev + 0.75 * (0.60 * torch.tanh(pred[:, 0:1, :]))
+        # Preserve expressive F0 inflection while keeping causal ConvNeXt denoising
+        src_log_f0 = src_base_log_f0 + 0.45 * comb_dev + 0.55 * (0.65 * torch.tanh(pred[:, 0:1, :]))
         uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 0.5)
 
         if spk_emb is not None:
@@ -243,8 +243,8 @@ class CausalPitchConditioner(nn.Module):
                 min=self.log_base_min,
                 max=math.log(340.0),
             )
-            prosody = 0.45 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.45)
-            adapted_log_f0 = tgt_base_log_f0 + 0.85 * prosody
+            prosody = 0.65 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.65)
+            adapted_log_f0 = tgt_base_log_f0 + prosody
         else:
             tgt_base_log_f0 = src_base_log_f0
             adapted_log_f0 = src_log_f0

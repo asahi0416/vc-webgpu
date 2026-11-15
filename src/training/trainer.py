@@ -78,8 +78,15 @@ class VCTrainer:
     ) -> None:
         self.model = model.to(device)
         self.device = torch.device(device)
+        # Training-only projection head for ContentVec causal distillation (not exported to ONNX)
+        self.ssl_proj = nn.Conv1d(
+            model.core.content_encoder.dim, 768, kernel_size=1
+        ).to(self.device)
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=lr, betas=(0.8, 0.99), weight_decay=1e-4
+            list(self.model.parameters()) + list(self.ssl_proj.parameters()),
+            lr=lr,
+            betas=(0.8, 0.99),
+            weight_decay=1e-4,
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=max(1, total_steps), eta_min=lr * 0.05
@@ -144,6 +151,19 @@ class VCTrainer:
             content_clean.mean(dim=-1).pow(2).mean()
             + content_feat.mean(dim=-1).pow(2).mean()
         )
+        if "ssl_feat" in batch:
+            ssl_tgt_n = F.normalize(batch["ssl_feat"].to(self.device), p=2.0, dim=1)
+            ssl_pred_c = F.normalize(self.ssl_proj(content_clean), p=2.0, dim=1)
+            ssl_pred_p = F.normalize(self.ssl_proj(content_feat), p=2.0, dim=1)
+            ssl_cos = 0.5 * (
+                (1.0 - (ssl_pred_c * ssl_tgt_n).sum(dim=1))
+                + (1.0 - (ssl_pred_p * ssl_tgt_n).sum(dim=1))
+            )
+            ssl_distill_loss = (ssl_cos * active_w).sum() / (active_w.sum() + 1e-5) + 0.15 * (
+                F.l1_loss(ssl_pred_c, ssl_tgt_n) + F.l1_loss(ssl_pred_p, ssl_tgt_n)
+            )
+        else:
+            ssl_distill_loss = content_feat.sum() * 0.0
         pitch_shift = torch.zeros(batch_size, 1, device=self.device)
         f0_feat, pred_f0, pred_uv, _ = pc(
             src_mag, perturbed_src_mel, pitch_shift, pc_cache, spk_emb=spk_emb
@@ -351,6 +371,7 @@ class VCTrainer:
             + 0.6 * content_inv_loss
             + 0.8 * content_var_loss
             + 0.15 * content_bias_loss
+            + 1.5 * ssl_distill_loss
             + 1.0 * f0_loss
             + 0.6 * spk_loss
             + 0.5 * mel_spk_loss
@@ -359,7 +380,9 @@ class VCTrainer:
         )
 
         total_loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(
+            list(self.model.parameters()) + list(self.ssl_proj.parameters()), max_norm=1.0
+        )
         self.optimizer.step()
         self.scheduler.step()
         self.global_step += 1
@@ -369,6 +392,7 @@ class VCTrainer:
             "rf_loss": float(rf_loss.item()),
             "cm_loss": float(cm_loss.item()),
             "mel_l1": float(mel_l1_loss.item()),
+            "ssl_loss": float(ssl_distill_loss.item()),
             "f0_loss": float(f0_loss.item()),
             "spk_loss": float(spk_loss.item()),
             "vocoder_loss": float(vocoder_loss.item()),

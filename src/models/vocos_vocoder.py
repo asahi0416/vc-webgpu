@@ -213,6 +213,14 @@ class CausalVocosVocoder(nn.Module):
         # Taper high harmonics (> 5.2 kHz) gently into breathiness without turning [2.3k-5.2k] into noise
         hf_taper = torch.sigmoid((5200.0 - harm_freq) / 900.0)
         harm_wave = (self.harm_weights * nyq_mask * hf_taper * sin_bank).sum(dim=1, keepdim=True)
+        # Subtle causal per-frame glottal shimmer softens rigid periodic pulse buzz
+        shimmer = (
+            (1.0 + 0.06 * torch.tanh(noise_seed[:, :1, :]))
+            .unsqueeze(-1)
+            .expand(batch_size, 1, t_frames, self.hop_length)
+            .reshape(batch_size, 1, out_samples)
+        )
+        harm_wave = harm_wave * shimmer
         noise_wav = torch.matmul(noise_seed.transpose(1, 2), self.noise_basis).reshape(
             batch_size, 1, out_samples
         )
@@ -221,7 +229,7 @@ class CausalVocosVocoder(nn.Module):
         )
         exc = (
             uv_samples * harm_wave * 0.085
-            + uv_samples * noise_hp * 0.005
+            + uv_samples * noise_hp * 0.009
             + (1.0 - 0.90 * uv_samples) * noise_wav * 0.032
         ).squeeze(1)
 

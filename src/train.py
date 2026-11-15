@@ -58,6 +58,18 @@ def main() -> None:
         help="Optional checkpoint path to resume training from",
     )
     parser.add_argument(
+        "--warm-start",
+        type=str,
+        default=None,
+        help="Optional checkpoint path to warm-start shape-matching weights from",
+    )
+    parser.add_argument(
+        "--ssl-cache-dir",
+        type=str,
+        default=None,
+        help="Optional directory containing pre-extracted ContentVec .pt features",
+    )
+    parser.add_argument(
         "--export-onnx",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -129,10 +141,13 @@ def main() -> None:
 
 def _build_dataset(args: argparse.Namespace, use_auto_hf: bool):
     if args.data_dir:
-        print(f"[Train] Loading WAV dataset from: {args.data_dir}")
+        ssl_dir = Path(args.ssl_cache_dir) if args.ssl_cache_dir else Path(f"{args.data_dir}_ssl")
+        use_ssl = ssl_dir if ssl_dir.exists() else None
+        print(f"[Train] Loading WAV dataset from: {args.data_dir}" + (f" (SSL={use_ssl})" if use_ssl else ""))
         return WAVVoiceDataset(
             data_dir=args.data_dir,
             segment_frames=args.segment_frames,
+            ssl_cache_dir=use_ssl,
         )
 
     if use_auto_hf:
@@ -203,6 +218,14 @@ def _run_training(args: argparse.Namespace, dataset, device: str) -> None:
         ckpt = trainer.load_checkpoint(args.resume)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         print(f"[Train] Resumed from {args.resume} at step {trainer.global_step}")
+    elif getattr(args, "warm_start", None):
+        ckpt = torch.load(args.warm_start, map_location=device, weights_only=True)
+        src_sd = ckpt.get("model_state", ckpt)
+        cur_sd = model.state_dict()
+        matched = {k: v for k, v in src_sd.items() if k in cur_sd and cur_sd[k].shape == v.shape}
+        cur_sd.update(matched)
+        model.load_state_dict(cur_sd, strict=True)
+        print(f"[Train] Warm-started {len(matched)}/{len(cur_sd)} tensors from {args.warm_start}")
 
     print(
         f"[Train] Device={device} | Epochs={args.epochs} | "
@@ -230,8 +253,9 @@ def _run_training(args: argparse.Namespace, dataset, device: str) -> None:
             f"[Epoch {epoch}/{start_epoch + args.epochs - 1}] ({dt:.1f}s) "
             f"total={avg_metrics['total_loss']:.4f} | "
             f"rf={avg_metrics['rf_loss']:.4f} | cm={avg_metrics['cm_loss']:.4f} | "
-            f"mel={avg_metrics['mel_l1']:.4f} | f0={avg_metrics['f0_loss']:.4f} | "
-            f"spk={avg_metrics['spk_loss']:.4f} | voc={avg_metrics['vocoder_loss']:.4f}"
+            f"mel={avg_metrics['mel_l1']:.4f} | ssl={avg_metrics.get('ssl_loss', 0.0):.4f} | "
+            f"f0={avg_metrics['f0_loss']:.4f} | spk={avg_metrics['spk_loss']:.4f} | "
+            f"voc={avg_metrics['vocoder_loss']:.4f}"
         )
 
     saved = trainer.save_checkpoint(
