@@ -167,6 +167,53 @@
     return `nan=${nNan}/${arr.length} [${mn.toFixed(2)},${mx.toFixed(2)}]`;
   }
 
+  // 2nd-order Biquad filter (Butterworth) for multiband envelope & consonant articulation preservation
+  function makeBiquadFilter(type, fc, fs = SR_OUT, Q = 0.7071) {
+    const w0 = (2.0 * Math.PI * fc) / fs;
+    const cosW0 = Math.cos(w0);
+    const sinW0 = Math.sin(w0);
+    const alpha = sinW0 / (2.0 * Q);
+    let b0, b1, b2, a0, a1, a2;
+    if (type === "lowpass") {
+      b0 = (1.0 - cosW0) / 2.0;
+      b1 = 1.0 - cosW0;
+      b2 = (1.0 - cosW0) / 2.0;
+      a0 = 1.0 + alpha;
+      a1 = -2.0 * cosW0;
+      a2 = 1.0 - alpha;
+    } else {
+      b0 = (1.0 + cosW0) / 2.0;
+      b1 = -(1.0 + cosW0);
+      b2 = (1.0 + cosW0) / 2.0;
+      a0 = 1.0 + alpha;
+      a1 = -2.0 * cosW0;
+      a2 = 1.0 - alpha;
+    }
+    return {
+      b0: b0 / a0,
+      b1: b1 / a0,
+      b2: b2 / a0,
+      a1: a1 / a0,
+      a2: a2 / a0,
+    };
+  }
+
+  function applyBiquad(wav, coeffs) {
+    const out = new Float32Array(wav.length);
+    const { b0, b1, b2, a1, a2 } = coeffs;
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < wav.length; i++) {
+      const x0 = wav[i];
+      const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      out[i] = y0;
+      x2 = x1;
+      x1 = x0;
+      y2 = y1;
+      y1 = y0;
+    }
+    return out;
+  }
+
   class SeedVcEngine {
     static SAMPLE_RATE = SR_OUT;
 
@@ -796,7 +843,7 @@
       return { mean, std };
     }
 
-    applyWhisperAdaIN(data, frames, dim = 768, wav16 = null, useStreamEma = false) {
+    applyWhisperAdaIN(data, frames, dim = 768, wav16 = null, useStreamEma = false, f0 = null) {
       if (!this.ref || !this.ref.sOriMean || !this.ref.sOriStd || frames <= 1) return data;
       let { mean: mSrc, std: sSrc } = this.computeFeatureStats(data, frames, dim, wav16);
       if (useStreamEma) {
@@ -817,8 +864,12 @@
       const out = new Float32Array(data.length);
       for (let t = 0; t < frames; t++) {
         const off = t * dim;
+        // Voiced-Adaptive AdaIN: 有声(母音)フレームは100%話者適応(alpha=1.0)、無声子音フレームは元の子音ダイナミクスを75%保持(alpha=0.25)
+        const isVoiced = f0 && t < f0.length ? f0[t] > 40.0 : true;
+        const alpha = isVoiced ? 1.0 : 0.25;
         for (let d = 0; d < dim; d++) {
-          out[off + d] = ((data[off + d] - mSrc[d]) / sSrc[d]) * sOri[d] + mOri[d];
+          const adainVal = ((data[off + d] - mSrc[d]) / sSrc[d]) * sOri[d] + mOri[d];
+          out[off + d] = data[off + d] * (1.0 - alpha) + adainVal * alpha;
         }
       }
       return out;
@@ -927,15 +978,16 @@
       const src16 = sampleRate === SR_OUT ? resample44to16Fast(src44) : await resampleAudio(audioFloat32, sampleRate, SR_16K);
 
       const { nFrames: T_src } = this.computeBigvganMel(src44);
-      const tW0 = performance.now();
-      const S_alt = await this.runWhisper(src16, "変換元", onProgress);
-      if (opts.useAdain !== false) {
-        S_alt.data = this.applyWhisperAdaIN(S_alt.data, S_alt.frames, 768, src16, Boolean(opts.isStream));
-      }
-      const tWhisperMs = performance.now() - tW0;
       const tY0 = performance.now();
       const F0_alt = await this.runRmvpe(src16, "変換元", onProgress);
       const tYinMs = performance.now() - tY0;
+
+      const tW0 = performance.now();
+      const S_alt = await this.runWhisper(src16, "変換元", onProgress);
+      if (opts.useAdain !== false) {
+        S_alt.data = this.applyWhisperAdaIN(S_alt.data, S_alt.frames, 768, src16, Boolean(opts.isStream), F0_alt);
+      }
+      const tWhisperMs = performance.now() - tW0;
 
       if (pitchShift !== 0) {
         const factor = Math.pow(2.0, pitchShift / 12.0);
@@ -960,6 +1012,15 @@
         onProgress,
         maxPromptFrames
       );
+
+      // Multiband adaptive articulation envelope match
+      const bLow = makeBiquadFilter("lowpass", 2500, SR_OUT);
+      const bHigh = makeBiquadFilter("highpass", 2800, SR_OUT);
+      const srcLow = applyBiquad(src44, bLow);
+      const srcHigh = applyBiquad(src44, bHigh);
+      const srcLowEnv = this.computeSmoothEnv(srcLow, T_src, 512, 6);
+      const srcHighEnv = this.computeSmoothEnv(srcHigh, T_src, 512, 2);
+      this.applyEnvelopeMatch(outWav, srcLowEnv, srcHighEnv, 0);
 
       return {
         audio: outWav,
@@ -1140,11 +1201,11 @@
         }
         sFrames = totalF;
       }
+      const f0 = await this.runRmvpe(src16, "変換元全体", onProgress);
       if (opts.useAdain !== false) {
-        sData = this.applyWhisperAdaIN(sData, sFrames, 768, src16);
+        sData = this.applyWhisperAdaIN(sData, sFrames, 768, src16, false, f0);
       }
 
-      const f0 = await this.runRmvpe(src16, "変換元全体", onProgress);
       if (pitchShift !== 0) {
         const factor = Math.pow(2.0, pitchShift / 12.0);
         for (let i = 0; i < f0.length; i++) {
@@ -1160,8 +1221,16 @@
         f0: new this.ort.Tensor("float32", f0, [1, f0.length]),
       });
       const condFull = new Float32Array(lrRes[lrSess.outputNames[0]].data);
-      const srcEnv = this.computeSmoothEnv(src44, T_full);
-      return { condFull, T_full, src44, srcEnv };
+
+      // Multiband adaptive articulation envelope precomputation
+      const bLow = makeBiquadFilter("lowpass", 2500, SR_OUT);
+      const bHigh = makeBiquadFilter("highpass", 2800, SR_OUT);
+      const srcLow = applyBiquad(src44, bLow);
+      const srcHigh = applyBiquad(src44, bHigh);
+      const srcLowEnv = this.computeSmoothEnv(srcLow, T_full, 512, 6);
+      const srcHighEnv = this.computeSmoothEnv(srcHigh, T_full, 512, 2);
+      const srcEnv = this.computeSmoothEnv(src44, T_full, 512, 10);
+      return { condFull, T_full, src44, srcLowEnv, srcHighEnv, srcEnv };
     }
 
     computeSmoothEnv(wav, nFrames, hop = 512, radius = 10) {
@@ -1185,35 +1254,91 @@
       return smooth;
     }
 
-    applyEnvelopeMatch(out, srcEnv, startFrame) {
+    applyEnvelopeMatch(out, srcLowEnv, srcHighEnv = null, startFrame = 0) {
       const hop = 512;
       const nFrames = Math.ceil(out.length / hop);
-      if (nFrames <= 0 || !srcEnv) return;
-      const outEnv = this.computeSmoothEnv(out, nFrames, hop, 10);
-      const gains = new Float32Array(nFrames);
+      if (nFrames <= 0 || !srcLowEnv) return;
+
+      // Legacy fallback if only single-band env is provided
+      if (!srcHighEnv) {
+        const outEnv = this.computeSmoothEnv(out, nFrames, hop, 10);
+        const gains = new Float32Array(nFrames);
+        for (let f = 0; f < nFrames; f++) {
+          const sIdx = Math.min(srcLowEnv.length - 1, startFrame + f);
+          const sRms = srcLowEnv[sIdx];
+          const oRms = outEnv[f];
+          gains[f] = sRms < 0.003 ? 0.0 : (oRms < 0.015 ? 1.0 : Math.min(1.0, sRms / oRms));
+        }
+        for (let f = 0; f < nFrames; f++) {
+          const g0 = gains[f];
+          const g1 = f + 1 < nFrames ? gains[f + 1] : g0;
+          const s = f * hop;
+          const e = Math.min(out.length, s + hop);
+          const len = e - s;
+          for (let i = 0; i < len; i++) {
+            const t = i / len;
+            out[s + i] *= g0 + (g1 - g0) * t;
+          }
+        }
+        return;
+      }
+
+      // Multiband Adaptive Articulation Envelope Match
+      // Low band (<2500Hz): Preserves target vocal timbre and prevents clipping (radius=6, gain <= 1.0)
+      // High band (>2800Hz): Restores sharp consonant transients and fricative air (radius=2, adaptive gain up to 2.5x)
+      const bLow = makeBiquadFilter("lowpass", 2500, SR_OUT);
+      const bHigh = makeBiquadFilter("highpass", 2800, SR_OUT);
+      const outLow = applyBiquad(out, bLow);
+      const outHigh = applyBiquad(out, bHigh);
+
+      const outLowEnv = this.computeSmoothEnv(outLow, nFrames, hop, 6);
+      const outHighEnv = this.computeSmoothEnv(outHigh, nFrames, hop, 2);
+
+      const gLow = new Float32Array(nFrames);
+      const gHigh = new Float32Array(nFrames);
+
       for (let f = 0; f < nFrames; f++) {
-        const sIdx = Math.min(srcEnv.length - 1, startFrame + f);
-        const sRms = srcEnv[sIdx];
-        const oRms = outEnv[f];
-        if (sRms < 0.003) {
-          gains[f] = 0.0;
-        } else if (oRms < 0.015) {
-          gains[f] = 1.0;
+        const sIdx = Math.min(srcLowEnv.length - 1, startFrame + f);
+        const sl = srcLowEnv[sIdx];
+        const ol = outLowEnv[f];
+        gLow[f] = sl < 0.003 ? 0.0 : (ol < 0.015 ? 1.0 : Math.min(1.0, sl / ol));
+
+        const sh = srcHighEnv[sIdx];
+        const oh = outHighEnv[f];
+        if (sh < 0.001) {
+          gHigh[f] = 0.0;
+        } else if (oh < 0.003) {
+          gHigh[f] = 1.0;
         } else {
-          // Purely linear gain (capped at 1.0) to restore source dynamics without nonlinear distortion
-          gains[f] = Math.min(1.0, sRms / oRms);
+          const ratio = sh / oh;
+          gHigh[f] = Math.max(0.5, Math.min(2.5, ratio));
         }
       }
+
       for (let f = 0; f < nFrames; f++) {
-        const g0 = gains[f];
-        const g1 = f + 1 < nFrames ? gains[f + 1] : g0;
+        const gl0 = gLow[f];
+        const gl1 = f + 1 < nFrames ? gLow[f + 1] : gl0;
+        const gh0 = gHigh[f];
+        const gh1 = f + 1 < nFrames ? gHigh[f + 1] : gh0;
         const s = f * hop;
         const e = Math.min(out.length, s + hop);
         const len = e - s;
         for (let i = 0; i < len; i++) {
           const t = i / len;
-          out[s + i] *= g0 + (g1 - g0) * t;
+          const gl = gl0 + (gl1 - gl0) * t;
+          const gh = gh0 + (gh1 - gh0) * t;
+          out[s + i] = outLow[s + i] * gl + outHigh[s + i] * gh;
         }
+      }
+
+      let pk = 0;
+      for (let i = 0; i < out.length; i++) {
+        const av = Math.abs(out[i]);
+        if (av > pk) pk = av;
+      }
+      if (pk > 0.95) {
+        const scale = 0.95 / pk;
+        for (let i = 0; i < out.length; i++) out[i] *= scale;
       }
     }
 
@@ -1262,8 +1387,10 @@
         this.streamPrevTail = null;
       }
 
-      if (opts.srcEnv) {
-        this.applyEnvelopeMatch(out, opts.srcEnv, startFrame);
+      if (opts.srcLowEnv && opts.srcHighEnv) {
+        this.applyEnvelopeMatch(out, opts.srcLowEnv, opts.srcHighEnv, startFrame);
+      } else if (opts.srcEnv) {
+        this.applyEnvelopeMatch(out, opts.srcEnv, null, startFrame);
       }
 
       let outPeak = 0;
@@ -1417,8 +1544,14 @@
         this.streamLeftCtx.set(newChunk44, this.streamCtxSamples - nNew);
       }
 
-      const chunkEnv = this.computeSmoothEnv(newChunk44, Math.ceil(nNew / 512), 512, 10);
-      this.applyEnvelopeMatch(out, chunkEnv, 0);
+      const bLow = makeBiquadFilter("lowpass", 2500, SR_OUT);
+      const bHigh = makeBiquadFilter("highpass", 2800, SR_OUT);
+      const cLow = applyBiquad(newChunk44, bLow);
+      const cHigh = applyBiquad(newChunk44, bHigh);
+      const nChunkFrames = Math.ceil(nNew / 512);
+      const cLowEnv = this.computeSmoothEnv(cLow, nChunkFrames, 512, 6);
+      const cHighEnv = this.computeSmoothEnv(cHigh, nChunkFrames, 512, 2);
+      this.applyEnvelopeMatch(out, cLowEnv, cHighEnv, 0);
 
       let outPeak = 0;
       let outSumSq = 0;

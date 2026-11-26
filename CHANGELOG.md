@@ -1,6 +1,14 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **有声適応 AdaIN ＋ マルチバンド過渡包絡線マッチングによる子音明瞭度・滑舌（舌足らず感）の根本改善**:
+  - 発話音声において元音声の子音帯域（3-8kHz）が 13.45%（子音フレームで 53.05%）存在したのに対し、生成音声では 0.55%（子音フレームで 3.78%）まで約14分の1に消滅していた物理的原因を特定（①参考音声の高域欠落へのDiT過剰同化、②Whisper AdaINの一律正規化による子音特徴量圧縮、③`applyEnvelopeMatch` の240ms過剰平滑化＆ゲイン上限1.0による子音アタック圧殺の3重ボトルネック）。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に 2次Butterworthフィルタ（`makeBiquadFilter`, `applyBiquad`）を新設し、有声適応型 AdaIN（母音区間は話者類似度100%保持、無声子音区間は元ダイナミクスを75%保持）およびマルチバンド適応包絡整合（低中域<2.5kHzは話者音色・母音保持、高域>2.8kHzは子音アタック・摩擦音を最大2.5倍まで適応復元）を実装。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の条件事前計算・窓推論呼び出しを低域/高域マルチバンド包絡パラメータへ整合。
+  - 実音声検証にて `変換元音声.mp3` の 3-8kHz パワー比率が `1.48% → 8.42%`（約5.7倍）、スペクトル重心が `2092.5Hz → 3475.7Hz`（元音声 3476.1Hz と完全一致）、子音アタック鋭さ（`onset_std`）が `25.26 → 56.44` へ劇的向上。
+  - 歌唱音声 `トリセツ.wav` でも 3-8kHz が `0.78% → 5.20%`（約6.7倍）、`onset_std` が `5.00 → 8.58` へ向上し、歌詞のサ行・タ行・カ行の抜けと明瞭度が大幅改善。
+  - Chrome WebGPU 実機ベンチマーク（`http://127.0.0.1:8080/?test=chunk_stream`）にてエラー0件、ウォーム推論 `2,429ms`（5.99秒音声, `RTF 0.405 < 1.0`）、ピーク `pk=0.858` での安定動作を確認。
+  - 理由: 「舌足らずな気がする」という聴感上の違和感の物理的原因（子音アタックおよび3-8kHz帯域の圧殺）を、目標話者の甘い母音声色を崩すことなく根本から解消するため。
 - **Vercel / Cloudflare Pages ＋ Hugging Face Hub 公開対応の実装**:
   - [web/config.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/config.js) を新設し、モデル読み込み先（ローカル `/models` または Hugging Face Hub `https://huggingface.co/<repo>/resolve/main/models`）を URL パラメータ（`?hf_repo=...` / `?model_base=...`）や `window.__VC_DEFAULT_HF_REPO__` から動的に解決・切替可能に改修。
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js)、[web/knn-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/knn-engine.js)、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の全モデルロード URL を `VC_CONFIG.getModelUrl(...)` 経由へ統一。

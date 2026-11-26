@@ -1315,12 +1315,12 @@
         await state.seedvcEngine.setReference(ref, sr);
         state.seedvcEngine.resetStream();
         const src = generateSyntheticReferenceAudio(12.0, 330.0);
-        const { condFull, T_full, srcEnv } = await state.seedvcEngine.precomputeSourceCond(src, sr);
+        const { condFull, T_full, srcLowEnv, srcHighEnv, srcEnv } = await state.seedvcEngine.precomputeSourceCond(src, sr);
         const chunkFrames = 516;
         const totalChunks = Math.ceil(T_full / chunkFrames);
         let prevLast = 0;
         for (let c = 0; c < totalChunks; c++) {
-          const conv = await state.seedvcEngine.convertCondWindow(condFull, T_full, c * chunkFrames, chunkFrames, 16, 8, { steps: 1, cfgRate: 0.0, srcEnv });
+          const conv = await state.seedvcEngine.convertCondWindow(condFull, T_full, c * chunkFrames, chunkFrames, 16, 8, { steps: 1, cfgRate: 0.0, srcLowEnv, srcHighEnv, srcEnv });
           const a = conv.audio;
           let maxAmp1 = 0, sum1 = 0, maxJump1 = 0, maxAmpAll = 0;
           for (let i = 0; i < a.length; i++) {
