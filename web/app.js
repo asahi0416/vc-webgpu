@@ -122,9 +122,11 @@
   }
 
   const state = {
-    engine: "knn",
+    engine: "seedvc",
     knnEngine: null,
     knnReady: false,
+    seedvcEngine: null,
+    seedvcReady: false,
     backendName: "unknown",
     speakerSession: null,
     coreSession: null,
@@ -146,7 +148,15 @@
     isConvertingFile: false,
     fileAbort: false,
     filePlayCtx: null,
+    fileDryGain: null,
+    fileWetGain: null,
     fileOutputUrl: null,
+    fileInputUrl: null,
+    fileLoop: true,
+    isFileLoopback: false,
+    lastRefAudio: null,
+    lastRefLabel: null,
+    extractedRefByEngine: {},
   };
 
   // DOM Elements
@@ -172,6 +182,10 @@
     srcFileInput: document.getElementById("src-file-input"),
     btnStopFileVc: document.getElementById("btn-stop-file-vc"),
     fileVcStatus: document.getElementById("file-vc-status"),
+    fileLoopbackBar: document.getElementById("file-loopback-bar"),
+    fileLoopbackAudio: document.getElementById("file-loopback-audio"),
+    btnFilePlayPause: document.getElementById("btn-file-play-pause"),
+    btnFileLoop: document.getElementById("btn-file-loop"),
     fileVcOutput: document.getElementById("file-vc-output"),
     fileVcPlayer: document.getElementById("file-vc-player"),
     fileVcDownload: document.getElementById("file-vc-download"),
@@ -258,17 +272,45 @@
   }
 
   function activeModelsReady() {
-    return state.engine === "knn" ? state.knnReady : state.modelsReady;
+    if (state.engine === "knn") return state.knnReady;
+    if (state.engine === "seedvc") return state.seedvcReady;
+    return state.modelsReady;
   }
 
   function hasReferenceReady() {
     if (state.engine === "knn") {
       return Boolean(state.knnEngine && state.knnEngine.nRef > 0);
     }
+    if (state.engine === "seedvc") {
+      return Boolean(state.seedvcEngine && state.seedvcEngine.ref);
+    }
     return Boolean(state.spkEmbData);
   }
 
   async function extractSpeakerEmbedding(float32Audio, label = "参照音声", updateUi = true) {
+    if (updateUi) {
+      state.lastRefAudio = float32Audio;
+      state.lastRefLabel = label;
+    }
+    if (state.engine === "seedvc") {
+      if (!state.seedvcReady || !state.seedvcEngine) {
+        throw new Error("Seed-VC エンジンがまだ初期化されていません。");
+      }
+      if (updateUi) el.refStatus.textContent = "Seed-VC 参照抽出中...";
+      const res = await state.seedvcEngine.setReference(float32Audio, SAMPLE_RATE, (msg) => {
+        if (updateUi) el.refStatus.textContent = msg;
+      });
+      if (updateUi) {
+        state.extractedRefByEngine.seedvc = float32Audio;
+        drawSpeakerEmbedding(res.embedding);
+        el.refStatus.textContent = `${label} (${res.seconds.toFixed(1)}秒 / ${res.frames}fr)`;
+        el.refTime.textContent = `${res.buildMs.toFixed(1)} ms`;
+        el.refNorm.textContent = `${res.frames} fr`;
+        log(`Seed-VC 参照抽出完了 [${label}]: ${res.frames}フレーム (${res.seconds.toFixed(1)}秒, ${res.buildMs.toFixed(0)} ms)`);
+      }
+      return null;
+    }
+
     if (state.engine === "knn") {
       if (!state.knnReady || !state.knnEngine) {
         throw new Error("kNN-VC モデルがまだロードされていません。");
@@ -278,6 +320,7 @@
         if (updateUi) el.refStatus.textContent = `kNN 特徴抽出中 (${w}/${tot})...`;
       });
       if (updateUi) {
+        state.extractedRefByEngine.knn = float32Audio;
         el.refStatus.textContent = `${label} (${res.seconds.toFixed(1)}秒 / ${res.frames}fr)`;
         el.refTime.textContent = `${res.buildMs.toFixed(1)} ms`;
         el.refNorm.textContent = `${res.frames} fr`;
@@ -311,6 +354,7 @@
 
     state.spkEmbData = emb;
     if (updateUi) {
+      state.extractedRefByEngine.flow = float32Audio;
       el.refStatus.textContent = `${label} (${(usableLen / SAMPLE_RATE).toFixed(1)}秒)`;
       el.refTime.textContent = `${elapsedMs.toFixed(1)} ms`;
       el.refNorm.textContent = l2Norm.toFixed(4);
@@ -391,11 +435,14 @@
       }
     }
 
+    const getFlowModelUrl = (filename) =>
+      (window.VC_CONFIG && window.VC_CONFIG.getModelUrl(filename)) || `/models/${filename}`;
+
     const createWithProvider = async (providers) => {
-      const spk = await ort.InferenceSession.create("/models/speaker_encoder.onnx", {
+      const spk = await ort.InferenceSession.create(getFlowModelUrl("speaker_encoder.onnx"), {
         executionProviders: providers,
       });
-      const core = await ort.InferenceSession.create("/models/streaming_vc_core.onnx", {
+      const core = await ort.InferenceSession.create(getFlowModelUrl("streaming_vc_core.onnx"), {
         executionProviders: providers,
       });
       return { spk, core };
@@ -485,7 +532,21 @@
       el.statusBackend.textContent = "バックエンド検証中...";
       el.statusModel.textContent = "ONNXモデル読込中...";
 
-      if (state.engine === "knn") {
+      if (state.engine === "seedvc") {
+        if (!state.seedvcEngine) {
+          state.seedvcEngine = new window.SeedVcEngine();
+        }
+        if (!state.seedvcReady) {
+          await state.seedvcEngine.load(ort, (msg) => {
+            el.statusModel.textContent = msg;
+            log(`[Seed-VC] ${msg}`);
+          });
+          state.seedvcReady = true;
+        }
+        state.backendName = `${state.seedvcEngine.backendLabel} (Seed-VC)`;
+        el.statusModel.textContent = "準備完了 (Seed-VC 44.1kHz)";
+        log(`Seed-VC 初期化完了 (${state.backendName})`);
+      } else if (state.engine === "knn") {
         await initKnnModels();
         el.statusModel.textContent = "準備完了 (kNN-VC 16kHz)";
         log(`kNN-VC 初期化完了 (${state.backendName})`);
@@ -577,14 +638,29 @@
     return new Blob([buffer], { type: "audio/wav" });
   }
 
+  function syncFilePlayPauseBtn() {
+    if (!el.btnFilePlayPause || !el.fileLoopbackAudio) return;
+    el.btnFilePlayPause.textContent = el.fileLoopbackAudio.paused ? "▶️ 再生" : "⏸️ 一時停止";
+  }
+
   async function stopFilePlayback() {
     state.fileAbort = true;
+    state.fileDryGain = null;
+    state.fileWetGain = null;
     if (state.filePlayCtx) {
       try {
         await state.filePlayCtx.close();
       } catch (_) {}
       state.filePlayCtx = null;
     }
+    if (state.isStreaming && state.isFileLoopback) {
+      await stopRealtimeVC();
+      return;
+    }
+    if (el.fileLoopbackAudio && !el.fileLoopbackAudio.paused) {
+      el.fileLoopbackAudio.pause();
+    }
+    if (el.fileLoopbackBar) el.fileLoopbackBar.hidden = true;
     el.btnStopFileVc.hidden = true;
   }
 
@@ -597,188 +673,46 @@
     state.isConvertingFile = true;
     state.fileAbort = false;
     el.srcFileInput.disabled = true;
-    el.btnStopFileVc.hidden = false;
-    el.fileVcStatus.textContent = `デコード中: ${file.name}...`;
+    el.fileVcStatus.textContent = `ループバック準備中: ${file.name}...`;
 
     try {
-      log(`変換元ファイルをデコード中: ${file.name}`);
-      const isKnn = state.engine === "knn";
-      const playRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
-      const chunkLen = isKnn ? window.KnnVcEngine.CHUNK : CHUNK_SAMPLES;
-      const alignTrim = isKnn ? window.KnnVcEngine.ALIGN_TRIM_SAMPLES : 720;
-
-      const srcAudio = await decodeAudioFileToMono(file, playRate);
       if (!hasReferenceReady()) {
         el.fileVcStatus.textContent = "自動参照音声を準備中...";
         await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
       }
 
-      if (isKnn) {
-        state.knnEngine.reset();
-      } else {
-        state.cacheManager.reset();
+      if (state.fileInputUrl) {
+        URL.revokeObjectURL(state.fileInputUrl);
       }
+      state.fileInputUrl = URL.createObjectURL(file);
 
-      const playCtx = new AudioContext({ sampleRate: playRate, latencyHint: "interactive" });
-      state.filePlayCtx = playCtx;
-      if (playCtx.state === "suspended") {
-        await playCtx.resume();
-      }
+      // Replace <audio> element so createMediaElementSource can bind cleanly to a new AudioContext
+      const freshAudio = el.fileLoopbackAudio.cloneNode(false);
+      freshAudio.src = state.fileInputUrl;
+      freshAudio.loop = state.fileLoop;
+      freshAudio.addEventListener("play", syncFilePlayPauseBtn);
+      freshAudio.addEventListener("pause", syncFilePlayPauseBtn);
+      freshAudio.addEventListener("ended", syncFilePlayPauseBtn);
+      el.fileLoopbackAudio.replaceWith(freshAudio);
+      el.fileLoopbackAudio = freshAudio;
 
-      const totalChunks = Math.ceil(srcAudio.length / chunkLen);
-      const chunkMs = (chunkLen / playRate) * 1000;
-      const outRaw = new Float32Array(totalChunks * chunkLen);
-      const chunkBuf = new Float32Array(chunkLen);
-      let inferTotalMs = 0;
-      let playedChunks = 0;
-      // Dynamically adjust pre-buffer size from measured inference speed so playback never underruns mid-file
-      let targetPrebuffer = Math.min(totalChunks, state.bypass ? 1 : 2);
-      const prebuffered = [];
-      let playbackStarted = false;
-      let nextPlayTime = 0;
+      el.fileLoopbackBar.hidden = false;
+      el.btnStopFileVc.hidden = false;
+      el.fileVcOutput.hidden = true;
 
-      const schedulePlay = (samples) => {
-        const audioBuf = playCtx.createBuffer(1, chunkLen, playRate);
-        audioBuf.copyToChannel(samples, 0);
-        const srcNode = playCtx.createBufferSource();
-        srcNode.buffer = audioBuf;
-        srcNode.connect(playCtx.destination);
-        const now = playCtx.currentTime;
-        if (nextPlayTime === 0) {
-          nextPlayTime = now + 0.05;
-        } else if (nextPlayTime < now + 0.005) {
-          nextPlayTime = now + (isKnn ? 0.15 : 0.05);
-        }
-        srcNode.start(nextPlayTime);
-        nextPlayTime += chunkLen / playRate;
-      };
-
-      for (let idx = 0; idx < totalChunks; idx++) {
-        if (state.fileAbort) break;
-
-        const start = idx * chunkLen;
-        const end = Math.min(srcAudio.length, start + chunkLen);
-        chunkBuf.fill(0);
-        chunkBuf.set(srcAudio.subarray(start, end));
-
-        const inputRms = computeRms(chunkBuf);
-        let playSamples;
-        if (state.bypass) {
-          playSamples = new Float32Array(chunkBuf);
-          outRaw.set(playSamples, start);
-          el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
-          el.meterOut.style.width = `${Math.min(100, inputRms * 350)}%`;
-          drawWaveforms(chunkBuf, playSamples);
-        } else {
-          let outChunk;
-          let inferMs;
-          if (isKnn) {
-            const t0 = performance.now();
-            outChunk = await state.knnEngine.processChunk(chunkBuf);
-            inferMs = performance.now() - t0;
-            state.totalChunks += 1;
-            el.perfChunks.textContent = String(state.totalChunks);
-          } else {
-            const res = await runStreamingChunk(chunkBuf);
-            outChunk = res.outChunk;
-            inferMs = res.inferMs;
-          }
-          playSamples = outChunk;
-          outRaw.set(outChunk, start);
-          inferTotalMs += inferMs;
-          const outRms = computeRms(outChunk);
-          el.meterIn.style.width = `${Math.min(100, inputRms * 350)}%`;
-          el.meterOut.style.width = `${Math.min(100, outRms * 350)}%`;
-          el.perfAvgMs.textContent = `${inferMs.toFixed(2)} ms`;
-          el.perfRtf.textContent = (inferMs / (isKnn ? 200.0 : 40.0)).toFixed(3);
-          drawWaveforms(chunkBuf, outChunk);
-        }
-
-        if (state.fileAbort) break;
-        playedChunks = idx + 1;
-
-        if (!playbackStarted) {
-          if (!state.bypass && playedChunks >= 2) {
-            const avgMs = inferTotalMs / playedChunks;
-            const effMs = avgMs * 1.15;
-            if (effMs > chunkMs) {
-              const needed = Math.ceil(totalChunks * (1 - chunkMs / effMs)) + 2;
-              targetPrebuffer = Math.min(totalChunks, Math.max(targetPrebuffer, needed));
-            }
-          }
-          prebuffered.push(playSamples);
-          if (playedChunks < targetPrebuffer) {
-            el.fileVcStatus.textContent = `先読み変換中 (${playedChunks}/${targetPrebuffer})...`;
-            continue;
-          }
-          playbackStarted = true;
-          for (const buf of prebuffered) schedulePlay(buf);
-          prebuffered.length = 0;
-        } else {
-          schedulePlay(playSamples);
-        }
-
-        el.fileVcStatus.textContent = `リアルタイム再生中 (${playedChunks}/${totalChunks})...`;
-
-        const maxAhead = isKnn ? 2.0 : 0.40;
-        while (!state.fileAbort && nextPlayTime - playCtx.currentTime > maxAhead) {
-          await new Promise((r) => setTimeout(r, 25));
-        }
-      }
-
-      if (!state.fileAbort && prebuffered.length > 0) {
-        for (const buf of prebuffered) schedulePlay(buf);
-        prebuffered.length = 0;
-      }
-
-      if (!state.fileAbort) {
-        const remainMs = Math.max(0, (nextPlayTime - playCtx.currentTime) * 1000);
-        if (remainMs > 0) {
-          await new Promise((r) => setTimeout(r, Math.min(remainMs + 40, 2000)));
-        }
-      }
-
-      if (state.filePlayCtx === playCtx) {
-        try {
-          await playCtx.close();
-        } catch (_) {}
-        state.filePlayCtx = null;
-      }
-
-      if (playedChunks > 0) {
-        const delay = state.bypass ? 0 : Math.min(alignTrim, playedChunks * chunkLen);
-        const validEnd = Math.min(playedChunks * chunkLen, delay + srcAudio.length);
-        const trimmed = outRaw.subarray(delay, Math.max(delay, validEnd));
-        const wavBlob = encodeWavBlob(trimmed, playRate);
-
-        if (state.fileOutputUrl) {
-          URL.revokeObjectURL(state.fileOutputUrl);
-        }
-        state.fileOutputUrl = URL.createObjectURL(wavBlob);
-        el.fileVcPlayer.src = state.fileOutputUrl;
-        el.fileVcDownload.href = state.fileOutputUrl;
-        const baseName = file.name.replace(/\.[^.]+$/, "");
-        el.fileVcDownload.download = `${baseName}_converted.wav`;
-        el.fileVcOutput.hidden = false;
-      }
-
-      const avgMs = playedChunks > 0 ? inferTotalMs / playedChunks : 0;
-      const durSec = srcAudio.length / playRate;
-      el.fileVcStatus.textContent = state.fileAbort
-        ? `停止: ${file.name} (${playedChunks}/${totalChunks}チャンク)`
-        : `再生完了: ${file.name} (${durSec.toFixed(2)}秒 / 平均 ${avgMs.toFixed(1)} ms)`;
-      log(`ファイルリアルタイム再生${state.fileAbort ? "停止" : "完了"} [${file.name}]: ${playedChunks}チャンク, 平均 ${avgMs.toFixed(2)} ms`);
+      await startRealtimeVC({ mediaElement: freshAudio, fileName: file.name });
+      await freshAudio.play();
+      syncFilePlayPauseBtn();
+      el.fileVcStatus.textContent = `🔁 ループバック変換中: ${file.name}`;
+      log(`ファイル入力ループバック開始 [${file.name}] (ループ: ${state.fileLoop ? "ON" : "OFF"})`);
     } catch (err) {
       el.fileVcStatus.textContent = `再生エラー: ${err.message}`;
-      log(`ファイル再生エラー: ${err.message}`);
+      log(`ファイルループバックエラー: ${err.message}`);
+      await stopFilePlayback();
     } finally {
       state.isConvertingFile = false;
-      state.fileAbort = false;
-      el.btnStopFileVc.hidden = true;
       el.srcFileInput.disabled = false;
       el.srcFileInput.value = "";
-      el.meterIn.style.width = "0%";
-      el.meterOut.style.width = "0%";
     }
   }
 
@@ -885,9 +819,11 @@
       });
   }
 
-  async function startRealtimeVC() {
+  async function startRealtimeVC(options = {}) {
     if (state.isStreaming) return;
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const mediaEl = options.mediaElement || null;
+    const isFileMode = Boolean(mediaEl);
+    if (!isFileMode && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
       log("マイク入力がサポートされていません（HTTPSまたはlocalhost環境が必要です）。");
       return;
     }
@@ -896,6 +832,154 @@
       if (!hasReferenceReady()) {
         await extractSpeakerEmbedding(generateSyntheticReferenceAudio(), "自動テスト音声");
       }
+      if (state.engine === "seedvc") {
+        const ctxRate = window.SeedVcEngine.SAMPLE_RATE;
+        const stream = isFileMode
+          ? null
+          : await navigator.mediaDevices.getUserMedia({
+              audio: {
+                channelCount: 1,
+                sampleRate: ctxRate,
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+            });
+        const ctx = new AudioContext({ sampleRate: ctxRate, latencyHint: "interactive" });
+        if (ctx.state === "suspended") await ctx.resume();
+        const source = isFileMode
+          ? ctx.createMediaElementSource(mediaEl)
+          : ctx.createMediaStreamSource(stream);
+        const proc = ctx.createScriptProcessor(1024, 1, 1);
+        const silentGain = ctx.createGain();
+        silentGain.gain.value = 0;
+
+        state.seedvcEngine.resetStream();
+        const chunkSamples = state.seedvcEngine.streamChunkSamples; // 40 * 512 = 20,480 (~0.464s)
+        const rightMargin = state.seedvcEngine.streamRightSamples;  // 8 * 512 = 4,096 (~93ms)
+        const micQueue = [];
+        let micQueuedSamples = 0;
+
+        proc.onaudioprocess = (ev) => {
+          if (!state.isStreaming) return;
+          const inp = ev.inputBuffer.getChannelData(0);
+          micQueue.push(new Float32Array(inp));
+          micQueuedSamples += inp.length;
+          // Drop oldest excess for live mic so latency stays bounded; keep larger buffer for file loopback
+          const maxQueued = isFileMode
+            ? chunkSamples * 8 + rightMargin
+            : chunkSamples * 2 + rightMargin;
+          while (micQueuedSamples > maxQueued && micQueue.length > 1) {
+            const dropped = micQueue.shift();
+            micQueuedSamples -= dropped.length;
+          }
+          const rms = computeRms(inp);
+          el.meterIn.style.width = `${Math.min(100, rms * 350)}%`;
+        };
+        source.connect(proc);
+        proc.connect(silentGain);
+        silentGain.connect(ctx.destination);
+
+        state.audioCtx = ctx;
+        state.micStream = stream;
+        state.micSource = source;
+        state.workletNode = proc;
+        state.isStreaming = true;
+        state.isFileLoopback = isFileMode;
+        el.btnToggleVc.textContent = "⏹️ リアルタイム変換停止";
+        el.btnToggleVc.classList.add("active-stop");
+        if (!isFileMode) {
+          el.fileVcStatus.textContent = "🎙️ Seed-VC リアルタイム変換中...";
+          log(`Seed-VC リアルタイムストリーミング開始 (SR: ${ctx.sampleRate} Hz, チャンク: 0.46s / 左文脈0.56s / 3sプロンプト)`);
+        }
+
+        const pullSamples = (n) => {
+          const out = new Float32Array(n);
+          let off = 0;
+          while (off < n && micQueue.length > 0) {
+            const head = micQueue[0];
+            const take = Math.min(n - off, head.length);
+            out.set(head.subarray(0, take), off);
+            off += take;
+            micQueuedSamples -= take;
+            if (take < head.length) {
+              micQueue[0] = head.subarray(take);
+            } else {
+              micQueue.shift();
+            }
+          }
+          return out;
+        };
+
+        let nextPlayTime = 0;
+        (async () => {
+          while (state.isStreaming && state.audioCtx === ctx) {
+            if (micQueuedSamples < chunkSamples + rightMargin) {
+              await new Promise((r) => setTimeout(r, 10));
+              continue;
+            }
+            const piece = pullSamples(chunkSamples);
+            // Peek rightMargin from head of micQueue without consuming it
+            const rightCtx = new Float32Array(rightMargin);
+            let rOff = 0;
+            for (let q = 0; q < micQueue.length && rOff < rightMargin; q++) {
+              const take = Math.min(rightMargin - rOff, micQueue[q].length);
+              rightCtx.set(micQueue[q].subarray(0, take), rOff);
+              rOff += take;
+            }
+            try {
+              let outAudio;
+              let outRms;
+              let elapsedMs = 0;
+              if (state.bypass) {
+                outAudio = piece;
+                outRms = computeRms(piece);
+              } else {
+                const conv = await state.seedvcEngine.convertChunkStream(
+                  piece,
+                  { pitchShift: state.pitchShift, steps: 1, cfgRate: 0.0, rightCtx }
+                );
+                outAudio = conv.audio;
+                outRms = conv.rms;
+                elapsedMs = conv.elapsedMs;
+              }
+              if (!state.isStreaming || state.audioCtx !== ctx) break;
+              const now = ctx.currentTime;
+              let playAudio = outAudio;
+              if (nextPlayTime === 0) {
+                nextPlayTime = now + (isFileMode ? 0.15 : 0.04);
+              } else if (nextPlayTime < now + 0.015) {
+                nextPlayTime = now + (isFileMode ? 0.08 : 0.03);
+                const fadeLen = Math.min(Math.round(ctxRate * 0.015), outAudio.length);
+                playAudio = new Float32Array(outAudio);
+                for (let i = 0; i < fadeLen; i++) {
+                  playAudio[i] *= i / fadeLen;
+                }
+              }
+              const buf = ctx.createBuffer(1, playAudio.length, ctxRate);
+              buf.copyToChannel(playAudio, 0);
+              const srcNode = ctx.createBufferSource();
+              srcNode.buffer = buf;
+              srcNode.connect(ctx.destination);
+              srcNode.start(nextPlayTime);
+              nextPlayTime += buf.duration;
+
+              state.totalChunks += 1;
+              el.perfChunks.textContent = String(state.totalChunks);
+              el.meterOut.style.width = `${Math.min(100, outRms * 350)}%`;
+              drawWaveforms(piece, outAudio);
+              const durSec = outAudio.length / ctxRate;
+              el.perfAvgMs.textContent = `${elapsedMs.toFixed(0)} ms`;
+              el.perfRtf.textContent = (elapsedMs / 1000 / Math.max(0.01, durSec)).toFixed(3);
+            } catch (err) {
+              log(`Seed-VC ライブ変換エラー: ${err.message}`);
+              break;
+            }
+          }
+        })();
+        return;
+      }
+
       const isKnn = state.engine === "knn";
       if (isKnn) {
         state.knnEngine.reset();
@@ -904,20 +988,24 @@
       }
       const ctxRate = isKnn ? window.KnnVcEngine.SAMPLE_RATE : SAMPLE_RATE;
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: ctxRate,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
+      const stream = isFileMode
+        ? null
+        : await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: ctxRate,
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+            },
+          });
 
       const ctx = new AudioContext({ sampleRate: ctxRate, latencyHint: "interactive" });
       await ctx.audioWorklet.addModule(isKnn ? "/web/knn-audio-worklet.js" : "/web/vc-audio-worklet.js");
 
-      const source = ctx.createMediaStreamSource(stream);
+      const source = isFileMode
+        ? ctx.createMediaElementSource(mediaEl)
+        : ctx.createMediaStreamSource(stream);
       const workletNode = new AudioWorkletNode(ctx, isKnn ? "knn-stream-processor" : "vc-stream-processor", {
         numberOfInputs: 1,
         numberOfOutputs: 1,
@@ -944,6 +1032,7 @@
       state.micSource = source;
       state.workletNode = workletNode;
       state.isStreaming = true;
+      state.isFileLoopback = isFileMode;
 
       el.btnToggleVc.textContent = "⏹️ リアルタイム変換停止";
       el.btnToggleVc.classList.add("active-stop");
@@ -955,9 +1044,14 @@
   }
 
   async function stopRealtimeVC() {
+    const wasFileLoopback = state.isFileLoopback;
     state.isStreaming = false;
+    state.isFileLoopback = false;
     state.pendingChunk = null;
 
+    if (wasFileLoopback && el.fileLoopbackAudio && !el.fileLoopbackAudio.paused) {
+      el.fileLoopbackAudio.pause();
+    }
     if (state.workletNode) {
       state.workletNode.disconnect();
       state.workletNode = null;
@@ -975,16 +1069,51 @@
       state.audioCtx = null;
     }
 
+    if (wasFileLoopback) {
+      if (el.fileLoopbackBar) el.fileLoopbackBar.hidden = true;
+      el.btnStopFileVc.hidden = true;
+      el.fileVcStatus.textContent = "音声ファイル (.mp3 / .wav 等) を選択してリアルタイム再生";
+    }
     el.btnToggleVc.textContent = "▶️ リアルタイム変換開始";
     el.btnToggleVc.classList.remove("active-stop");
     el.meterIn.style.width = "0%";
     el.meterOut.style.width = "0%";
-    log("リアルタイムVC停止");
+    log(wasFileLoopback ? "ファイルループバックVC停止" : "リアルタイムVC停止");
   }
 
   async function runBenchmark() {
     if (!activeModelsReady()) return;
     el.btnRunBench.disabled = true;
+    if (state.engine === "seedvc") {
+      el.benchStatus.textContent = "Seed-VC (1秒音声) ベンチマーク実行中...";
+      try {
+        if (!hasReferenceReady()) {
+          const ref = generateSyntheticReferenceAudio(REF_SECONDS, 220.0);
+          await extractSpeakerEmbedding(ref, "ベンチマークテスト話者");
+        }
+        const sr = window.SeedVcEngine.SAMPLE_RATE;
+        const src = new Float32Array(sr);
+        for (let i = 0; i < sr; i++) src[i] = 0.25 * Math.sin((2 * Math.PI * 330 * i) / sr);
+        const conv = await state.seedvcEngine.convertAudio(src, sr, { pitchShift: 0, steps: 1, cfgRate: 0.0, maxPromptFrames: 258 }, (m) => {
+          el.benchStatus.textContent = m;
+        });
+        const rtf = conv.elapsedMs / 1000.0;
+        const tm = conv.timings
+          ? ` [W:${conv.timings.tWhisperMs.toFixed(0)}ms Y:${conv.timings.tYinMs.toFixed(0)}ms D:${conv.timings.tDitMs.toFixed(0)}ms BV:${conv.timings.tBigvganMs.toFixed(0)}ms]`
+          : "";
+        el.perfAvgMs.textContent = `${conv.elapsedMs.toFixed(0)} ms`;
+        el.perfRtf.textContent = rtf.toFixed(3);
+        el.benchStatus.textContent = `Seed-VC 完了: 1.0秒音声 -> ${(conv.elapsedMs / 1000).toFixed(2)}s (RTF ${rtf.toFixed(3)}, rms=${conv.rms.toFixed(3)}, peak=${conv.peak.toFixed(3)})${tm}`;
+        log(`Seed-VC ベンチマーク完了: ${(conv.elapsedMs / 1000).toFixed(2)}s (RTF ${rtf.toFixed(3)}, rms=${conv.rms.toFixed(3)}, peak=${conv.peak.toFixed(3)})${tm}`);
+        if (conv.dbg) log(`[Seed-VC DBG] ${conv.dbg}`);
+      } catch (err) {
+        el.benchStatus.textContent = `ベンチマークエラー: ${err.message}`;
+        log(`ベンチマークエラー: ${err.message}`);
+      } finally {
+        el.btnRunBench.disabled = false;
+      }
+      return;
+    }
     const isKnn = state.engine === "knn";
     const totalChunks = isKnn ? 5 : 20;
     const chunkLen = isKnn ? window.KnnVcEngine.CHUNK : CHUNK_SAMPLES;
@@ -1082,6 +1211,24 @@
     stopFilePlayback();
   });
 
+  el.btnFilePlayPause.addEventListener("click", () => {
+    if (!el.fileLoopbackAudio) return;
+    if (el.fileLoopbackAudio.paused) {
+      el.fileLoopbackAudio.play().catch((err) => log(`再生エラー: ${err.message}`));
+    } else {
+      el.fileLoopbackAudio.pause();
+    }
+  });
+
+  el.btnFileLoop.addEventListener("click", () => {
+    state.fileLoop = !state.fileLoop;
+    if (el.fileLoopbackAudio) {
+      el.fileLoopbackAudio.loop = state.fileLoop;
+    }
+    el.btnFileLoop.textContent = `🔁 ループ: ${state.fileLoop ? "ON" : "OFF"}`;
+    el.btnFileLoop.classList.toggle("active", state.fileLoop);
+  });
+
   el.btnRecordRef.addEventListener("click", () => {
     record3SecReference();
   });
@@ -1112,6 +1259,17 @@
     if (state.workletNode) {
       state.workletNode.port.postMessage({ type: "set_bypass", value: state.bypass });
     }
+    if (state.fileDryGain && state.fileWetGain && state.filePlayCtx) {
+      const t = state.filePlayCtx.currentTime;
+      state.fileDryGain.gain.setTargetAtTime(state.bypass ? 1.0 : 0.0, t, 0.01);
+      state.fileWetGain.gain.setTargetAtTime(state.bypass ? 0.0 : 1.0, t, 0.01);
+    }
+  });
+
+  el.fileVcPlayer.addEventListener("play", () => {
+    if (state.isConvertingFile && state.filePlayCtx) {
+      stopFilePlayback();
+    }
   });
 
   el.btnResetCache.addEventListener("click", () => {
@@ -1124,9 +1282,22 @@
   el.engineSelect.addEventListener("change", async () => {
     if (state.isStreaming) await stopRealtimeVC();
     if (state.isConvertingFile) await stopFilePlayback();
-    state.engine = el.engineSelect.value === "flow" ? "flow" : "knn";
-    log(`エンジン切替: ${state.engine === "knn" ? "kNN-VC (WavLM+HiFi-GAN)" : "Causal FlowVC"}`);
+    state.engine = el.engineSelect.value || "knn";
+    const labels = {
+      seedvc: "Seed-VC (WebGPU 44.1kHz)",
+      knn: "kNN-VC (WavLM+HiFi-GAN)",
+      flow: "Causal FlowVC",
+    };
+    log(`エンジン切替: ${labels[state.engine] || state.engine}`);
     await initModels();
+    if (state.lastRefAudio && state.extractedRefByEngine[state.engine] !== state.lastRefAudio) {
+      try {
+        log(`切替先エンジンで参照音声 [${state.lastRefLabel || "参照音声"}] を自動抽出中...`);
+        await extractSpeakerEmbedding(state.lastRefAudio, state.lastRefLabel || "参照音声", true);
+      } catch (err) {
+        log(`参照自動抽出エラー: ${err.message}`);
+      }
+    }
   });
 
   el.btnRunBench.addEventListener("click", () => {
@@ -1134,6 +1305,66 @@
   });
 
   // Boot
-  state.engine = el.engineSelect && el.engineSelect.value === "flow" ? "flow" : "knn";
-  initModels();
+  if (location.search.includes("test=chunk_stream")) {
+    state.engine = "seedvc";
+    if (el.engineSelect) el.engineSelect.value = "seedvc";
+    initModels().then(async () => {
+      try {
+        const sr = window.SeedVcEngine.SAMPLE_RATE;
+        const ref = generateSyntheticReferenceAudio(8.0, 220.0);
+        await state.seedvcEngine.setReference(ref, sr);
+        state.seedvcEngine.resetStream();
+        const src = generateSyntheticReferenceAudio(12.0, 330.0);
+        const { condFull, T_full, srcEnv } = await state.seedvcEngine.precomputeSourceCond(src, sr);
+        const chunkFrames = 516;
+        const totalChunks = Math.ceil(T_full / chunkFrames);
+        let prevLast = 0;
+        for (let c = 0; c < totalChunks; c++) {
+          const conv = await state.seedvcEngine.convertCondWindow(condFull, T_full, c * chunkFrames, chunkFrames, 16, 8, { steps: 1, cfgRate: 0.0, srcEnv });
+          const a = conv.audio;
+          let maxAmp1 = 0, sum1 = 0, maxJump1 = 0, maxAmpAll = 0;
+          for (let i = 0; i < a.length; i++) {
+            const av = Math.abs(a[i]);
+            if (av > maxAmpAll) maxAmpAll = av;
+            if (i < 2048) {
+              sum1 += a[i] * a[i];
+              if (av > maxAmp1) maxAmp1 = av;
+              if (i > 0) maxJump1 = Math.max(maxJump1, Math.abs(a[i] - a[i - 1]));
+            }
+          }
+          const bJump = c > 0 ? Math.abs(a[0] - prevLast) : 0;
+          prevLast = a[a.length - 1];
+          // Quick band energy check (<400Hz vs 1-3kHz) on first 4096 samples around middle
+          let eLow = 0, eMid = 0, eTot = 1e-12;
+          const midOff = Math.min(a.length - 1024, Math.floor(a.length / 2));
+          if (midOff >= 0) {
+            const N = 1024;
+            for (let k = 1; k < N / 2; k++) {
+              const freq = (k * sr) / N;
+              let re = 0, im = 0;
+              for (let n = 0; n < N; n++) {
+                const ang = (-2 * Math.PI * k * n) / N;
+                re += a[midOff + n] * Math.cos(ang);
+                im += a[midOff + n] * Math.sin(ang);
+              }
+              const p = re * re + im * im;
+              eTot += p;
+              if (freq < 400) eLow += p;
+              else if (freq >= 1000 && freq <= 3000) eMid += p;
+            }
+          }
+          log(
+            `[CHUNK_TEST c=${c + 1}] ms=${conv.elapsedMs.toFixed(0)} dur=${(a.length / sr).toFixed(2)}s rms=${conv.rms.toFixed(3)} pk=${maxAmpAll.toFixed(3)} ` +
+            `<400=${((eLow / eTot) * 100).toFixed(1)}% 1-3k=${((eMid / eTot) * 100).toFixed(1)}% bJump=${bJump.toFixed(4)}`
+          );
+        }
+        log("[CHUNK_TEST DONE]");
+      } catch (e) {
+        log(`[CHUNK_TEST ERR] ${e.message}`);
+      }
+    });
+  } else {
+    state.engine = (el.engineSelect && el.engineSelect.value) || "seedvc";
+    initModels();
+  }
 })();

@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2026-11-27
+- **Vercel / Cloudflare Pages ＋ Hugging Face Hub 公開対応の実装**:
+  - [web/config.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/config.js) を新設し、モデル読み込み先（ローカル `/models` または Hugging Face Hub `https://huggingface.co/<repo>/resolve/main/models`）を URL パラメータ（`?hf_repo=...` / `?model_base=...`）や `window.__VC_DEFAULT_HF_REPO__` から動的に解決・切替可能に改修。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js)、[web/knn-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/knn-engine.js)、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の全モデルロード URL を `VC_CONFIG.getModelUrl(...)` 経由へ統一。
+  - [vercel.json](file:///c:/Users/terus/Documents/antigravity/vc-iphone/vercel.json)（ルート用）・[web/vercel.json](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/vercel.json)（web/ルート用）・[web/_headers](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/_headers)（Cloudflare Pages用）を作成し、WebGPU および multi-thread WASM に必須の COOP (`same-origin`) / COEP (`credentialless`) ヘッダーを配信するように設定。
+  - [.vercelignore](file:///c:/Users/terus/Documents/antigravity/vc-iphone/.vercelignore) を配置し、ローカルの巨大 ONNX や学習データを Vercel デプロイから自動除外（数MBの静的アセットのみ即座に無料デプロイ可能）。
+  - [scripts/upload_to_hf.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/scripts/upload_to_hf.py) を作成し、必要な全モデル（Seed-VC, FlowVC, kNN-VC）をワンコマンドでご自身の Hugging Face Hub リポジトリへ一括アップロードできるように整備。
+  - 理由: Vercel の 1ファイル 100MB 制限や月間 100GB 帯域制限を回避し、完全無料で世界中へ公開・スケール可能にするため。
+
+## 2026-11-25
+- **標準エンジンを `Seed-VC (WebGPU 44.1kHz / 高品質)` へ変更**:
+  - [web/index.html](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/index.html) の `#engine-select` の `selected` と [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の初期エンジンを `knn` から `seedvc` へ変更。
+  - 理由: ページを開いた直後から手動切替なしで最高品質かつリアルタイム動作する Seed-VC が使えるようにするため。
+- **Seed-VC ストリーミングの大幅低遅延化（アルゴリズム遅延 `1,254ms → 557ms`）＆ストリーミング音質・境界連続性向上**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) のライブストリーミング窓を `L16/C100/R8 (124fr, algo 1,254ms)` から **`L48/C40/R8 (96fr, algo 557ms)`** へ刷新（遅延増ゼロの左コンテキストを `186ms → 557ms` へ拡張しつつ、出力ホップを `1.16s → 0.46s` へ短縮）。
+  - 同ファイルに `Whisper` 最小動的窓 **`150fr (1.5s)`** バケット（`[150, 300, 600, 1200, 3000]`）、ストリーミング用 **EMA Active-frame AdaIN**（`0.75/0.25` 指数移動平均による短チャンク声色安定化）、および **SOLA 位相整合クロスフェード**（`±5.8ms` 相互相関による BigVGAN 境界位相ズレ解消）を実装。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) のライブマイク入力バッファを `4096 → 1024`（`-70ms`）、ポーリング間隔を `25ms → 10ms`、初期ジッタバッファを `80ms → 40ms` へ短縮。
+  - 実音声ストリーミング評価にて `変換元音声.mp3`（`cos_tgt: 0.2665 → 0.5174`, `1-3kHz: 6.2% → 13.0%`, `bJump: 0.0884 → 0.0165`）・`トリセツ.wav`（`cos_tgt: 0.6356 → 0.6576`, `bJump: 0.4912 → 0.1952`）へ同時改善し、Chrome WebGPU 実機ベンチマークにて **`1.0秒音声 -> 501ms (RTF 0.501, [W:53ms Y:27ms D:217ms BV:138ms])`**・JSエラー0件を確認。
+  - なお 16ステップ CFG 教師からの直接 1ステップ蒸留（`seedvc_dit_1step_t16_v2.pt`）も検証したが、湾曲軌道の一括回帰誤差（`val=0.5019`）により発話品質が低下（`cos_tgt=0.4367`）したため不採用とし、既存の 2→1 段階蒸留モデル（`seedvc_dit_1step_prog.pt`, `val=0.2004`）を維持した。
+  - 理由: 従来のライブ遅延（約 1.94秒）の主因だった 1.16秒チャンク蓄積と左コンテキスト不足・無音パディング希釈・境界位相不連続を根本から同時解消するため。
+
+## 2026-11-18
+- **Seed-VC 1ステップ段階蒸留＋Active-frame AdaIN＋FCPE WebGPU 化による高速化・音質/類似度同時改善**:
+  - 無音フレームが `Whisper AdaIN` の平均・標準偏差を歪める問題と、2ステップ推論（`422ms`）および `fcpe.onnx` WASM 実行（`67ms`）のボトルネックを根本解消するため、Active-frame（発話区間限定）AdaIN＋2ステップ Self-CFG 教師から 800ペアを生成し、周波数軸勾配・時間軸勾配・分散維持損失付きで 2→1ステップ段階蒸留（`checkpoints/seedvc_dit_1step_prog.pt`, 10エポック `val: 0.5430 -> 0.2004`）を実施して [dit_student_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/dit_student_fp16.onnx)（`335.35 MB`, ORT `B=1 nan=0`）を更新。
+  - ユーザー実音声 E2E 評価で `変換元音声.mp3`（`cos_tgt: 0.4902 -> 0.5293`, `cos_src: 0.1058 -> 0.0424`）・`トリセツ.wav`（`cos_tgt: 0.6564 -> 0.6859`, `1-3kHz: 15.9% -> 18.5%`）と類似度・明瞭度・元声リーク抑制の全てが同時向上（[src_voice_prog_1st.wav](file:///c:/Users/terus/Documents/antigravity/vc-iphone/outputs/user_eval_v5/src_voice_prog_1st.wav), [torisetsu_prog_1st.wav](file:///c:/Users/terus/Documents/antigravity/vc-iphone/outputs/user_eval_v5/torisetsu_prog_1st.wav)）。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に Active-frame AdaIN と `fcpe.onnx` WebGPU 実行を統合し、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の全推論パス（ライブ・ベンチマーク・ファイル変換）を `steps: 1, cfgRate: 0.0` へ更新。Chrome WebGPU 実機ベンチマークにて **`1.0秒音声 -> 513ms (RTF 0.513, [W:56ms Y:28ms D:229ms BV:133ms])`**（従来 `702ms` から約189ms短縮・エラー0件）を確認。
+  - 理由: 対処療法の後処理ではなく、AdaIN の無音統計歪み・DiT 2回呼び出し・F0 CPU実行という根本原因を同時に解消するため。
+
 ## 2026-11-14
 - プロジェクト初期化
   - 内容: リポジトリ初期化、発見メモ.mdの作成、WebGPUリアルタイムストリーミングVCのアーキテクチャ設計
@@ -58,3 +86,155 @@
 - **ファイルリアルタイム再生の適応的プリバッファ**: [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `handleSourceFileConvert` で実測推論時間 (`avgMs * 1.15`) から再生途中で途切れない最小必要チャンク数 (`targetPrebuffer`) を自動算出し、その分を先読み変換してから再生開始するよう改善。理由: 推論が実時間 (200ms) を上回る環境でも再生開始後のアンダーランによる音切れを完全に防ぐため。
 - **低い声混入・無音ブザー・PSOLAかすれの根本解消**: [web/knn-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/knn-engine.js) にて、①無音時 WavLM ノイズ増幅による低い声出力 (`sil_v=41/46`) を `GATE_LOW=0.005, GATE_HIGH=0.015`（下限 `0.0`）で `1/46` へ抑制、②発話中の低い声混入 (`0 -> 8/49`) を招いていた `CENTER_ALPHA=0.5` を `0.0` に戻し（`sp_low=0/40`, `sp_med=339.8Hz`, `tgt=0.7119`）、③`TD-PSOLA` を `#pitch-shift` 変更時（`>= 0.1 st`）のみ適用し通常時はクリーンな HiFi-GAN 生波形 + 20ms OLA を出力するよう変更。理由: 診断実験で `CENTER_ALPHA=0.5`・甘い無音ゲート・常時PSOLA再合成が低い声混入とかすれの主因と特定されたため。
 - **kNN-VC の WebGPU 有効化（FP32 ONNX 優先 + WASM フォールバック）**: [web/knn-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/knn-engine.js) が `executionProviders: ["wasm"]` 固定だったため、`navigator.gpu` 利用可能時は FP32 版 `models/knn/wavlm6_w1500.onnx` (355 MB) + `models/knn/hifigan_dyn.onnx` (66 MB) を `["webgpu", "wasm"]` で実行するよう変更（非対応環境のみ `wavlm6_w1500_int8mm.onnx` + WASM へフォールバック）。[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) のログ表示とプリバッファ初期値 (`2`) も調整。ブラウザ実測（`http://127.0.0.1:8080/`）にて `Backend: WebGPU (kNN-VC)`、3秒参照抽出 `147.4 ms`、200msチャンク平均 `50.57 ms` (`min=44.9ms, max=58.3ms, RTF=0.253`, `ConsoleErrors: 0`) を確認。理由: GPU 搭載環境でも WASM 実行になっておりリアルタイム再生が間に合っていなかったため。
+
+## 2026-11-16
+- **Causal FlowVC への因果時間領域YIN統合・元声リーク除去・Seed-VC 教師蒸留**:
+  - [src/models/content_f0_extractor.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/content_f0_extractor.py)・[src/models/streaming_vc_pipeline.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/streaming_vc_pipeline.py) に因果時間領域YIN（`win=600, hop=240, min_tau=32, max_tau=282`）を組み込み、[src/models/causal_flow_matching.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/causal_flow_matching.py) の `base_mel` 直通ミックス（`0.85*w_detail + 0.50*w_broad`）を `0.15*w_detail + voice_gate*tgt_shape` へ復元。
+  - Seed-VC (`f0_condition=True`, 6ステップ, CFG=0.85) で `data/seedvc_distill/pairs.pt`（250組・185.1 MB）を生成し、RTX 4070 SUPER 上で計60エポック（Mel L1・1-4kHz L1・Flow・MultiResSTFT・話者類似度・元声リーク抑制・帯域比率ロス）の蒸留学習を実施して `checkpoints/vc_latest.pt` と `models/*.onnx` を再出力、`tests/test_models_and_onnx.py` 全5テスト合格を確認。
+  - 理由: 40msリアルタイム Causal FlowVC で元声似（「声が変換元に似てる」）・もごもご・ピッチ不安定を解消するため（保持テスト `24_flow_vc_distilled_24k.wav` で `F0 corr=0.9347`, `oct_jumps=12`, `cos_tgt=0.9123`, `cos_src=0.6207` を確認）。
+- **Seed-VC WebGPU の軽量・高速化（361.7MB RMVPE廃止・セッション常駐・4秒プロンプト・3ステップ化）**:
+  - CUDA比較検証で `3ステップ + CFG=0.85 + YIN`（`25b_seedvc_3st_cfg_yin`）が `time=2.06s (23.3s音声)`, `<400Hz=5.7%`, `1-3kHz=18.1%`, `rms=0.323` と `4ステップ + RMVPE`（`2.94s`, `1-3kHz=17.0%`）と同等以上の音質を維持することを確認（`CFG=0.0` は `<400Hz=20.3%`・`rms=0.089` へ劣化するため維持）。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) から 361.7MB の CPU WASM 実行 `rmvpe.onnx` を撤廃して純JS高速YIN（`computeYinF0`, 0MB）へ置換し、ONNXセッションの毎回破棄を廃止して `this.sessions` キャッシュへ変更、参照プロンプト上限を `10秒 -> 4秒` へ短縮、デフォルトステップ数を `4 -> 3` に変更（[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に各段の計測内訳 `W / Y / D / BV` 表示も追加）。
+  - 理由: ブラウザWebGPUでの `1.0秒あたり11.35秒` 遅延の主因（毎回1.15GBの再ロード＋シェーダ再コンパイル・361.7MB RMVPEのCPU実行・10秒プロンプトによるDiT計算量増）を解消するため。
+- **Seed-VC WebGPU チャンク連続ストリーミング & 実時間（`RTF 0.874 < 1.0`）達成**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の参照プロンプト上限を `3秒`（`258フレーム`）へ短縮し、無音スキップ・`186ms` 左コンテキスト・`46ms` Hann クロスフェード付きの `convertChunkStream`（`1.25秒` / `108フレーム` 単位）を実装。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の Seed-VC ファイル変換をチャンク順次 `AudioContext` 再生＋WAV連結保存へ変更し、ベンチマークを `2ステップ` へ更新。
+  - Chrome WebGPU（`http://127.0.0.1:8080/`）実機計測にて、ウォーム推論 **1.0秒音声 → `0.87s`（`RTF 0.874 < 1.0`、`[W:90ms Y:18ms D:520ms BV:157ms]`、`rms=0.863, peak=1.000`、致命的エラー0件）** を確認。
+  - さらにチャンク長不一致による毎チャンクWebGPUシェーダ再コンパイルと2048サンプルずれを修正（固定 `124フレーム` パディング＋2チャンク先読みプリバッファ）し、実音声 `00_reference.wav -> 00_source.wav`（`23.32秒`）のブラウザストリーミング変換で **合計処理 `23.03s`（`RTF 0.988 < 1.0`）** を確認。
+- **WebGPU `NaN` 飽和（「ぷつぷつ」音）の根本修正**:
+  - `[Seed-VC DBG]` 診断により、`whisper_small_enc_fp16.onnx` が Chrome WebGPU 上で `100% NaN`（`nan=38400/38400`）を出力し、下流の `LengthRegulator -> DiT -> BigVGAN` へ伝播して ±1.0 の矩形波クリック（`rms=0.863〜1.000`）になっていたことを特定。また `bigvgan_fp16.onnx` も WASM フォールバック時に `float16 Exp` 未対応で無音になる問題を確認。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `whisper_small_enc` と `bigvgan` を FP32 版（`whisper_small_enc.onnx` 352.7MB / `bigvgan.onnx` 490.8MB）へ切り替えた結果、全段 **`NaN = 0`**、`rms = 0.239`（正常波形）、ウォーム推論 **`0.87s`（`RTF 0.866 < 1.0`、`[W:109ms Y:21ms D:499ms BV:142ms]`）** を達成。
+  - 理由: 44.1kHz 高品質 Seed-VC を 100% ブラウザ完結のリアルタイム速度域で連続再生できるようにするため。
+- **Seed-VC かさつき解消・参照音声長拡張（CAMPPlus 15秒 / DiTプロンプト 6秒 / 3ステップ化）**:
+  - アブレーション検証により、かさつきの原因が DiT FP16 化ではなく「3秒プロンプト＋2ステップ推論による BigVGAN の ±1.0 飽和クリップ (`1.19%`)」と特定（`ref6s + style10s + 3steps` でクリップ率 `0.05%`・`1-3kHz=11.5%` へ改善）。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `setReference` で `CAMPPlus` を最大 **15秒**、DiT プロンプトを最大 **6秒** へ拡張し、出力に `0.92` ヘッドルームを適用。また [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) と [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の変換・ベンチマークを `steps: 3` へ変更し、デバッグログ出力を整理。
+  - Chrome WebGPU（`http://127.0.0.1:8080/`）実機計測でウォーム推論 **`1.04s`（`RTF 1.040`, `rms=0.155, peak=0.808`, `[W:89ms Y:13ms D:682ms BV:138ms]`, エラー0件）** を確認。
+  - 理由: 参照音声の短い切り取りによる話者特徴不足と、2ステップ・高音量飽和による音質のかさつきを解消するため。
+- **チャンク境界の音量急変・音割れ対策**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の波形出力を `Math.tanh(raw * 0.62)` によるソフトリミットへ変更し、BigVGAN 特有の過大振幅（`rms=0.50` / `peak=1.000`）による音割れ・音量ジャンプを抑制。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の Seed-VC ストリーミング再生に実測 RTF ベースの適応的プリバッファとアンダーラン復帰時 10ms フェードインを追加。
+  - ブラウザ実機計測で `rms=0.102, peak=0.496`（クリップ0）・エラー0件を確認。
+  - 理由: 無音/小音チャンクから大音圧チャンクへの遷移や、RTF > 1.0 時の再生アンダーラン復帰で境界ポップ・音割れが起きるのを防ぐため。
+- **Seed-VC チャンク境界の右端異常増幅（BigVGAN/Whisper 境界アーティファクト）の根本修正**:
+  - フレーム別波形計測により、`124` フレーム窓の末尾 `frames 116-124` で `rms=0.185 -> 0.674, pk=0.999` へ異常増幅しており、その末尾をクロスフェード用 `streamPrevTail` に使っていたことがチャンク境界の音割れ・音量跳ね上がりの真因と特定。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) と [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) を総長124フレーム固定のまま **`左コンテキスト16 + 出力100 (1.161s) + 右コンテキスト8 (93ms)`** のスライディング窓へ改修し、後続音声を先読みしつつ末尾8フレームを破棄するよう変更。
+  - ブラウザ実機（`?test=chunk_stream`）でチャンク2・3の境界ピークが `0.551(飽和) -> 0.481 / 0.508`、境界不連続 `bJump=0.0102 / 0.0089`、ウォーム処理時間 `1,143ms / 1,161ms (RTF 0.985)`、エラー0件を確認。
+  - 理由: 対症療法ではなく、右端境界の異常増幅区間そのものを生成・クロスフェード領域から物理的に除外するため。
+- **リアルタイム再生無音バグの修正（初回コールドコンパイル除外）**:
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `prebufTarget` 自動調整が初回チャンク（`idx === 0`, WebGPU シェーダコンパイル込み ~10秒 → `estRtf ≈ 8.7`）を参照して曲全体のチャンク数に膨らみ、変換完了までリアルタイム再生が開始されなかったバグを修正（`idx >= 1` のウォームチャンクのみ参照・上限4チャンク）。
+  - 理由: 2〜4チャンク先読み後すぐにリアルタイムストリーミング再生を開始できるようにするため。
+- **品質大幅改善: 8秒参照 + 曲全体Whisper一括抽出 + 6秒DiT窓 (`<400Hz=3.9%, 1-3kHz=19.6%, RTF 0.395`)**:
+  - 比較検証により、`1.16秒` 小チャンク分割が `1-3kHz` 明瞭度を `16.1〜18.1% → 9.7%` へ落とし `<400Hz` こもりを `5.7% → 11.2%` へ悪化させていたことを特定。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `setReference` を **DiTプロンプト8秒 + CAMPPlus 15秒** へ拡張し、曲全体の `Whisper + YIN + LengthRegulator` を1回で実行する `precomputeSourceCond` と固定540フレーム窓（`左16 + 出力516 (6.0秒) + 右8`）の `convertCondWindow`（`tanh(raw * 0.72)`）を実装（[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) のファイル変換も同方式へ切替）。
+  - オフライン比較で `<400Hz=3.9%, 1-3kHz=19.6%`（`25b` 以上の明瞭度）、ブラウザ WebGPU 実機（`?test=chunk_stream`）でウォーム推論 **`2,370 ms / 6.0秒`（`RTF 0.395`）・エラー0件** を確認。
+  - 理由: チャンク分割によるフレーズ文脈欠落と20回の境界劣化をなくし、元の `25b` と同等以上の音質をリアルタイム以上の速度で出すため。
+- **Whisper 無音パディング値バグの修正**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `computeWhisperFeatures` で `activeFrames..3000` を `0.0`（中音量ノイズ相当）で埋めていたため `WhisperFeatureExtractor` と `max_diff=7.8442` の乖離が生じていたバグを修正し、`(floorVal + 4.0) / 4.0` でパディングするよう変更。
+  - 理由: Whisper エンコーダの双方向アテンションがパディング領域の `0.0` を拾って意味特徴量（`S_ori` / `S_alt`）を劣化させるのを防ぐため。
+- **出力段リミッタ（対処療法）の撤廃**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `Math.tanh(raw * 0.72)` を削除し、BigVGAN 生出力をそのまま返すように変更。
+  - 理由: 右端8フレーム破棄と Whisper パディング修正により境界の異常増幅が根本解消されたため、高域・音圧を丸めていた対処療法を除去するため。
+- **DiT 4ステップ化（`RTF 0.482`・音割れ／ガラつき低減）**:
+  - WebGPU vs CPU WASM の実機比較で `BigVGAN`（`rms=0.198, pk=1.000, <400=8.0%, 1-3k=41.6%`）および `LengthRegulator`（`rms=0.197, pk=1.000`）の WebGPU 固有バグがないことを確認した上で、[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) および [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `convertCondWindow` デフォルトを **4ステップ** へ引き上げ（オフライン検証で `rms=0.269 -> 0.235`, `1-3k=19.6% -> 21.1%` 改善）。
+  - ブラウザ実機（`?test=chunk_stream`）でウォーム推論 **`2,892 ms / 6.0秒`（`RTF 0.482`）・エラー0件** を確認。
+  - 理由: 対処療法のリミッタを使わずに DiT 離散化誤差による過剰音圧・ガラつきを根本から抑えるため。
+- **元音声の音量包絡（RMSエンベロープ）線形追従による音量・抑揚の根本改善**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `computeSmoothEnv`・`applyEnvelopeMatch` を追加し、`precomputeSourceCond` で元音声全体の平滑 RMS 包絡（±10フレーム ≈ ±116ms 移動平均）を算出して `convertCondWindow` の出力へ線形ゲイン（`min(1.0, srcEnv / outEnv)`）を滑らかに適用（[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) 連携）。
+  - 理由: Seed-VC（Whisper＋F0）は元音声の音量情報を持たないため均一・過大な音圧（`pk=1.000`）になりがちだったが、非線形歪み（`tanh`）なしで元歌唱の強弱・静寂を忠実に再現し音割れを防ぐため。
+- **WebGPU シェーダ事前コンパイル & Seed-VC 連続リアルタイムマイク変換**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `warmupShaders([540, 124])` を追加し、`setReference` 完了時にファイル用（540fr）とライブマイク用（124fr）の WebGPU シェーダを事前コンパイルするように変更（変換開始後の初回11秒待ちを解消）。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の Seed-VC マイク入力を「録音停止後に一括変換」から、`1.16s` チャンク（`convertChunkStream`＋音量包絡追従）の連続ストリーミング再生へ変更。
+  - 理由: 変換開始時のシェーダコンパイル待ちをなくし、マイク入力も停止操作なしでリアルタイムに返せるようにするため。
+- **FCPE 高速ニューラル歌唱 F0 + Sway Sampling 統合**:
+  - 361.7MB の `rmvpe.onnx`（WASM 2.5秒）に代わる軽量高精度な歌唱向けニューラル F0 モデル **`FCPE`**（`models/seedvc/fcpe.onnx` 41.32MB + `fcpe_mel_128x513.bin`, CPU 1.0秒あたり `22ms`・PyTorch 版との誤差 `0.0001 Hz`）をエクスポートし、[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に組み込み。
+  - 同ファイルに少数ステップ高精度化スケジュール **Sway Sampling**（`sway = -0.8`, 計算コスト 0ms 増）を導入。
+  - 理由: リアルタイム性を損なわず（YIN 同等の約20ms）、RMVPE 相当の歌唱ピッチ精度と少数ステップの明瞭度を両立するため。
+- **FCPE 長尺入力時の UI フリーズ（「ページの応答が消えた」）修正**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `runRmvpe`（FCPE WASM 推論）を最大 **500フレーム（5秒）窓** へ分割＋チャンク間 `setTimeout(0)` でイベントループを返すように変更し、`setReference` の事前コンパイルを `[540]` のみに絞った。
+  - 理由: 23秒超の曲を一括で `fcpe.onnx`（WASM Conformer `O(T^2)` Attention）へ流すとメインスレッドが長時間ブロックされブラウザの応答なしダイアログが出るため。
+- **`Session already started` エラーの根本修正（セッション単位排他制御）**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `WeakMap` ベースの `runSession(sess, feeds)` キューを追加し、全9箇所の ONNX セッション実行を直列化。
+  - 理由: 事前コンパイルや連続操作中に同一 `InferenceSession` へ並列に `.run()` が入って `Session already started` 例外が出るのを完全に防ぐため。
+- **蒸留 2ステップ・CFGなし Seed-VC DiT のブラウザ WebGPU 統合**:
+  - 12ステップ＋CFGあり教師（`dit_ms=1,316ms`）から蒸留した `checkpoints/seedvc_dit_student.pt` を `models/seedvc/dit_student_fp16.onnx`（351.67MB, ORT `nan=0`）へエクスポートし、[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) と [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に `batch=1`（CFGなし）・`2ステップ` 推論として統合（ファイル変換・リアルタイムマイク・ベンチマークすべて適用）。
+  - 理由: 4ステップ×CFG（実質8回推論）を2回推論へ4分の1削減し、12ステップ教師に近い品質を保ったままブラウザ WebGPU を大幅高速化するため。
+
+## 2026-11-17
+- **Self-CFG 蒸留（`batch=1` 化）& `Whisper + FCPE` 並列化による約 1.5〜1.6倍高速化**:
+  - `micro CFG=0.45` の出力を `batch=1`（無CFG）の 2ステップ生徒へ直接蒸留（`checkpoints/seedvc_dit_student_cfg1pass.pt`, 8エポック `val_loss: 0.8290 -> 0.1443`）し、[dit_student_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/dit_student_fp16.onnx)（`335.35 MB`, ORT `B=1 nan=0`）へエクスポート。
+  - ユーザー音声 E2E 評価で `B2_microCFG0.4_2st` と比較し、`変換元音声.mp3`（`cos_tgt=0.4902, cos_src=0.1058, 1-3k=16.1%, flat>2k=0.0039`）および `トリセツ.wav`（`cos_tgt=0.6564, cos_src=0.3029, 1-3k=15.9%, flat>2k=0.0042`）と同等の品質・低かすれを維持したまま DiT 計算量を半減。
+  - さらに [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `runSession` をグローバル直列 `ortLock` キューへ強化（ORT Web の異なるセッション並列実行による `Session mismatch` 防止）し、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) を `steps: 2, cfgRate: 0.0`（1パスCFG版）へ更新。
+  - 理由: `AdaIN + micro CFG=0.4 (2st)` の音質・類似度を維持したまま、WebGPU `batch=2` 実行による `521ms` ボトルネックと特徴抽出の直列待ちを解消するため。
+- **ブラウザ版 `Seed-VC` への `Whisper AdaIN + micro CFG=0.4 (2st)` 本番統合**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `computeFeatureStats` / `applyWhisperAdaIN` を実装し、ピッチ（F0）を変えずに `S_alt` の各次元平均・標準偏差を `S_ori` へ自動整合するように改善。
+  - `runDitAndBigvgan` が `cfgRate > 0 && nSteps <= 2` のときに `dit_student_fp16.onnx`（`batch=2`）を使って等間隔 2ステップ micro-CFG（`0.4`）を実行するようにし、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) のライブ／ループバック・ベンチマーク・テストを `steps: 2, cfgRate: 0.4` へ更新。
+  - 理由: ユーザー試聴で高評価だった「原音高維持＋元声リーク極小＋高い話者類似度」をブラウザ WebGPU 上でもそのまま再現するため。
+- **`auto_f0_adjust` 撤去（原音高100%維持）& ピッチ維持 `Whisper AdaIN` 検証**:
+  - ピッチが勝手に変わってしまうため、`web/seed-vc-engine.js` から `auto_f0`（自動半音シフト）を即時撤去し、元のピッチを 100% 維持する仕様に戻した。
+  - ピッチを一切変えずに元声リークを抑える手法として `Whisper` 隠れ表現の統計アライン（`AdaIN`: `S_alt` の各次元平均・標準偏差を `S_ori` へ整合）を検証し、`変換元音声.mp3 -> 参考音声.mp3`（1st）で `cos_src: 0.1396 -> 0.0559`、`トリセツ.wav -> 参考音声.mp3`（1st）で `cos_tgt: 0.6302 -> 0.6425, cos_src: 0.3245 -> 0.3132`（`cfg=0.4, 2st` では `0.6629 / 0.2601`）を確認。
+  - 理由: ピッチを変えずに元話者の声質・環境バイアスだけを除去するため。
+- **半音単位の自動声域合わせ（`auto_f0_adjust`）導入による元声リーク解消・話者類似度大幅向上**:
+  - `変換元音声.mp3`（`367.9Hz`）・`トリセツ.wav`（`388.2Hz`）と `参考音声.mp3`（`237.4Hz`）の間に `+8〜+9半音` の声域差があり、`auto_f0_adjust` 未適用により変換元の高い声域のまま鳴って「変換元の声に似て聞こえる」原因になっていたことを特定。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `computeVoicedF0Median` と半音量子化 `autoSemi`（`round(12 * log2(refMed / srcMed))`、ストリーミング時は初回有声チャンクでロックして曲途中のキー揺れを防止）を実装。
+  - 実測にて、`トリセツ.wav -> 参考音声.mp3`（1st）が `cos_tgt: 0.6438 -> 0.7250`・元声リーク `cos_src: 0.3374 -> 0.2617`、`変換元音声.mp3 -> 参考音声.mp3`（1st/2st）が `cos_tgt: 0.4502 -> 0.4851 / 0.5006`・`cos_src: 0.1123 -> 0.0800` へ計算時間増ゼロで大幅改善することを確認。
+  - 理由: 歌唱時も調（キー）を外さずにターゲット話者の自然な声域へ自動整合させ、変換元の声っぽさが残る現象を根本解消するため。
+- **エンジン切替時の参照音声自動再抽出の実装**:
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に `state.lastRefAudio` / `state.lastRefLabel` / `state.extractedRefByEngine` を追加し、`extractSpeakerEmbedding` 実行時に参照音声波形を保持するように変更。
+  - `#engine-select` でエンジン（`Seed-VC` / `kNN-VC` / `Causal FlowVC`）を切り替えた際、`initModels()` 完了直後に保持中の参照音声を切替先エンジンへ自動で特徴抽出するように改善。
+  - 理由: エンジンを切り替えるたびに STEP 1 の参照音声を再選択・再録音する手間をなくすため。
+- **本家 `Whisper-Small` の動的短窓化（無音パディング希釈の根本解消・明瞭度＆類似度向上）**:
+  - 従来の 30秒固定窓（`win=3000`）では 1〜3秒の短尺音声に対して 27秒分の無音パディングが Self-Attention に混入し、特徴量が薄まって低域こもり・明瞭度低下を招いていた原因を特定。
+  - 無改造の本家 `Whisper-Small` Encoder を動的長さ対応（`DynamicWhisperEncoder`）として [whisper_small_enc.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/whisper_small_enc.onnx)（`336.41 MB`, PyTorch 誤差 `0.000138`, `nan=0`）へ再エクスポートし、[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `computeWhisperFeatures` / `runWhisper` を `[300 (3s), 600 (6s), 1200 (12s), 3000 (30s)]` バケット窓へ改修。
+  - ユーザー音声での実測比較：
+    - `変換元音声.mp3 -> 参考音声.mp3`: `win=3000` (`cos_tgt=0.4081, <400=24.1%, 1-3k=15.4%, flat>2k=0.0024`) → **`win=300` (`cos_tgt=0.4200, <400=22.5%, 1-3k=17.7%, flat>2k=0.0014`)** と全指標が改善。
+    - `トリセツ.wav -> 参考音声.mp3`: `win=3000` (`cos_tgt=0.6731, <400=14.6%, 1-3k=13.4%, flat>2k=0.0004`) → **`win=600` (`cos_tgt=0.6805, <400=13.8%, 1-3k=14.2%, flat>2k=0.0002`)** と全指標が改善。
+  - 理由: 対処療法の EQ や小規模データ蒸留による劣化を排し、68万時間学習済みの本家 Whisper の能力を 100% 引き出しつつ Attention 計算量を最大 1/100 に削減するため。
+- **`WhisperV3`（時間微分＋分散維持損失）＋ プレゼンス明瞭化EQの検証と ONNX 更新**:
+  - `WhisperStudentV2` に時間微分損失（`dt_l1`）とチャンネル分散維持損失（`std_l1`）を追加して 16 エポック学習（`checkpoints/whisper_student_v3.pt`, `val_cos=0.8795, val_dt=0.4670`）し、[whisper_causal_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/whisper_causal_fp16.onnx)（`33.35 MB`）へ更新。
+  - ユーザー標準音声（`トリセツ.wav`・`変換元音声.mp3` → `参考音声.mp3`）での評価において、`v2DiT_1st_W3 + clarityEQ`（140Hz HPF + 2.2kHz +3.5dB プレゼンスEQ）により以下を確認：
+    - `トリセツ.wav`: `cos_tgt=0.6596`（本家 Whisper 2st `0.6543` 超え）, `<400Hz=14.7%`, `1-3kHz=14.0%`, `flat>2k=0.0004`, CUDA `787.1ms`（12.0s分）
+    - `変換元音声.mp3`: `cos_tgt=0.3977`（本家 Whisper 2st `0.3791` 超え）, `<400Hz=33.3%`, `1-3kHz=17.1%`（本家 2st `14.9%` 超え）, `flat>2k=0.0009`, CUDA `139.1ms`（2.39s分）
+  - 理由: 軽量 `WhisperV2` 使用時に見られた低域こもりと `1-3kHz` 明瞭度不足を解消し、本家 336MB Whisper 以上の話者類似度と明瞭度を 1ステップ・33MB で達成するため。
+- **PC 上での高精度 `WhisperStudentV2`（`33.35 MB`・40ms先読み）蒸留・4ペア E2E 評価**:
+  - `data/jvnv`＋`data/mixed` 全 2,988 発話で 17.45M パラメータの `WhisperStudentV2`（40ms先読み）を 24 エポック蒸留（`val_cos=0.8618`）し、[whisper_causal_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/whisper_causal_fp16.onnx)（`33.35 MB`, ORT `nan=0`）へ更新。
+  - PC（RTX 4070 SUPER CUDA）での 4ペア・クロス話者 E2E ベンチマーク（4秒音声）にて以下を確認：
+    - `teacher_12st_trueW` (本家 336MB Whisper): `cos_tgt=0.7526`, `cos_src=0.3747`, `flat>2k=0.0040`, `cuda_ms=834.4ms`
+    - `student_2st_trueW` (2st + 336MB Whisper): `cos_tgt=0.7035`, `cos_src=0.3614`, `flat>2k=0.0036`, `cuda_ms=498.2ms`
+    - `student_2st_v2W` (2st + 33MB WhisperV2): `cos_tgt=0.6841`, `cos_src=0.3422`, `flat>2k=0.0007`, `cuda_ms=495.6ms`
+    - `student_1st_v2W` (1st + 33MB WhisperV2): `cos_tgt=0.6952`, `cos_src=0.3317`, `flat>2k=0.0008`, `cuda_ms=335.1ms`
+  - 理由: 本番採用前に PC 上で 30秒固定窓 Whisper を使わない軽量モデルの話者類似度・音質・速度が本家と遜色ないか実証するため。
+- **iPhone (iOS) ネイティブアプリ骨格 & 超軽量因果 `Whisper` (`15.62 MB`) 蒸留・ONNX化**:
+  - Mac なし環境向けに、XcodeGen ([ios/project.yml](file:///c:/Users/terus/Documents/antigravity/vc-iphone/ios/project.yml)) + GitHub Actions macOS ビルド ([.github/workflows/ios-build.yml](file:///c:/Users/terus/Documents/antigravity/vc-iphone/.github/workflows/ios-build.yml)) + SwiftUI/AVAudioEngine/ONNX Runtime (CoreML ANE) アプリ ([ios/Sources/](file:///c:/Users/terus/Documents/antigravity/vc-iphone/ios/Sources/ContentView.swift)) と導入ガイド ([ios/README.md](file:///c:/Users/terus/Documents/antigravity/vc-iphone/ios/README.md)) を構築。
+  - `Whisper-Small` Encoder（336.37MB・30秒固定窓）を 8.16M パラメータの完全因果 ConvNeXt 生徒へ蒸留（1,200発話・20エポック, `val_cos=0.7104`）し、`models/seedvc/whisper_causal_fp16.onnx`（**15.62 MB**, ORT `nan=0`）へエクスポート。`Seed-VC` E2E 評価で `cos_tgt=0.6011`（本家 `0.6525`）・`1-3k=21.2%`・`flat>2k=0.0044` を確認。
+  - 理由: iPhone 単体（ANE + Metal）でのゼロショット・歌唱対応・低遅延動作に向け、最大のボトルネックだった 30秒固定窓 Whisper を軽量因果化しつつ、Windows 環境から `.ipa` をビルドできる iOS ネイティブ基盤を整備するため。
+- **軽量・超低遅延 `MeanVC2 + F0` 日本語・歌唱対応モデルの実験・検証（`v1 -> v2`）**:
+  - `fastu2pp_160ms.pt` の ONNX エクスポート性（72.27MB, FP16 で約36MB）を確認した上で、`MeanVC2`（`120ms` チャンク + `40ms` ルックアヘッド）にゼロ初期化 `F0Adapter`（14次元調和 log-F0 + UV → 256次元）を追加。
+  - 日本語実音声 1,200発話（`data/meanvc2_jp_1200.pt`）＋ `Seed-VC` 教師生成のクロス話者 400ペア（`data/meanvc2_cross_400.pt`）＋ `Vocos` 微分可能 Multi-Resolution STFT 損失でファインチューン（`checkpoints/meanvc2_f0_jp_v2.pt`）を実施。
+  - 検証話者で `cross_tgt: cos_tgt=0.6085, cos_src=0.1729, 1-3k=29.4%`、`+5st: f0_med=401.8Hz`、KV キャッシュ 120ms ストリーミング出力（`outputs/meanvc2_f0_test/test_v2_cross_streaming.wav`）で `mean_bJump=0.0244` を確認。
+  - 理由: `Seed-VC`（800MB超・1〜2秒ラグ）の制約を根本解消し、iPhone Safari 圏内のモデルサイズ（FP16 合計 ~150MB 級）と超低遅延（アルゴリズム遅延 160ms）で高音質・歌唱対応・話者類似度を両立するため。
+- **Seed-VC ライブ／ループバックの 1ステップ化＆ジッタバッファ導入（途切れ根本解消）**:
+  - v2 蒸留モデル（`dit_student_fp16.onnx`）の 1ステップ（`t=0`）対 2ステップの Val Mel L1 比較を実施し、`1-step L1=0.1382` vs `2-step L1=0.1132` と極めて近い精度を確認した上で、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `startRealtimeVC`（`convertChunkStream`）および `runBenchmark` を `steps: 1`（`maxPromptFrames: 258`）へ変更。
+  - さらに `startRealtimeVC` の `nextPlayTime` 初期値を未開始 `0` とし、1チャンク目到着時に `now + 0.20s`（ファイルループバック）/ `now + 0.08s`（ライブマイク）のジッタバッファを設けてから連続再生を開始するように修正。
+  - 理由: `2ステップ` では DiT 推論が `479ms`（1秒音声全体で `817ms`）を占めてジッタ余裕が乏しく、また `nextPlayTime` を推論開始前に `now + 0.05` へ固定していたため初回チャンクから必ずアンダーランして途切れ途切れになっていた根本原因を解消するため。
+- **Seed-VC ストリーミング途切れ解消（3秒プロンプト・高速リサンプラ・事前ウォームアップ）**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に純JS 3-tap LPF＋線形補間リサンプラ `resample44to16Fast` を追加し、`OfflineAudioContext` 毎チャンク生成を廃止。
+  - `runDitAndBigvgan` / `convertAudio` に `maxPromptFrames` を導入し、ライブ／ループバック用 `convertChunkStream` では `3秒`（`258` フレーム）プロンプト・`1.161s`（`100` フレーム、窓長 `124` フレーム）で推論するように変更し、`setReference` で `{540, 0}` と `{124, 258}` の両方を事前ウォームアップするように改善。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) でファイルループバック時の入力キュー上限拡大（`8チャンク`）およびバッファリカバリ時 15ms フェードインを追加。
+  - 理由: `0.51s` チャンク＋`8秒` プロンプトでは固定オーバーヘッドで `RTF > 1.0` となり途切れ途切れになっていたため、DiT 系列長半減とシェーダ事前コンパイルにより連続再生可能な `RTF < 1.0` へ改善するため。
+- **VC Client風ファイル入力リアルタイムループバック再生の実装**:
+  - [web/index.html](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/index.html) の STEP 2 に `#file-loopback-bar`（`⏸️ 一時停止 / ▶️ 再生` ボタン、`<audio id="file-loopback-audio" controls loop>` シークバー付きプレイヤー、`🔁 ループ: ON/OFF` ボタン）を追加。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `handleSourceFileConvert` と `startRealtimeVC(options)` を統合し、選択ファイルを `createMediaElementSource` でマイク入力と同一のリアルタイム変換パイプライン（`Seed-VC` / `kNN-VC` / `Causal FlowVC` すべて対応）へ直接ループバック供給するように刷新（再生中のシーク・一時停止・ループ・ピッチシフト・バイパス・Input/Output メーター＆波形描画がすべて即時反映）。
+  - 理由: VC Client（w-okada）のファイル入力と同様に、一括事前解析なしでファイルを即座に再生・シーク・ループしつつマイクと同じパイプラインへ流し込めるようにするため。
+- **Seed-VC ファイルリアルタイム再生の Input/Output メーター・波形・再生制御の修正**:
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の `handleSourceFileConvert`（`seedvc` ブランチ）にて、①`playCtx.currentTime` に同期した `requestAnimationFrame` で `meterIn`・`meterOut`・`drawWaveforms` をリアルタイム更新、②`dryGain` / `wetGain` 2系統スケジュールによる再生中の `🔀 バイパス: ON/OFF` 即時切替対応、③再生完了まで `⏹️ 再生停止` ボタン（`btnStopFileVc`）を維持して待機＋`fileVcPlayer` 再生時の二重再生防止を実装。
+  - 理由: ファイルからのリアルタイム再生時に Input/Output メーターと波形が一切動かず、変換ループ終了と同時に再生中でも停止ボタンが消えて操作不能になっていた不具合を解消するため。
+- **Seed-VC DiT 2ステップ蒸留 v2（話者類似度強化）& ライブマイク遅延半減**:
+  - `data/mixed`＋`data/jvnv` から生成した700ペア（`cfg=1.05`・12ステップ教師・`ref<=5s`）で 2ステップ・CFGなし生徒 DiT を14エポック再蒸留（`checkpoints/seedvc_dit_student.pt`、評価 `outputs/compare_torisetsu/37_student_v2_2st_nocfg.wav` で `cos_tgt: 0.6406 -> 0.6837` へ向上）し、`models/seedvc/dit_student_fp16.onnx`（335.35MB, ORT `B=1 nan=0`）へ再エクスポート。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `streamChunkSamples` を `100*512`（1.16s）から `44*512`（`0.511s`, `16+44+8=68` フレーム）へ半減し、[web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) のログ表示を更新。
+  - ブラウザ WebGPU 実機（`http://127.0.0.1:8080/?test=chunk_stream`）にて `c=1: 5.99s -> 1,907ms (RTF 0.318, pk=0.917, bJump=0.0000)`、`c=2: 0.53s -> 1,767ms (pk=0.901, bJump=0.0378)`、コンソールエラー 0件を確認。
+  - 理由: ユーザー試聴の「若干似てない気がする」「リアルタイムでの遅延が少し気になる」という課題に対し、2ステップの速度を維持したまま話者類似度を教師モデル並みに引き上げ、ライブマイクの体感遅延を約半分に短縮するため。
+
+## 2026-11-15 (Seed-VC WebGPU 44.1kHz Integration)
+- **Seed-VC ONNX FP16化 & ブラウザWebGPUエンジン統合**: `Seed-VC`（`f0_condition=True`, 44.1kHz BigVGAN）の6モジュールをONNX化＋5モジュールをFP16化（`campplus_fp16.onnx`, `length_regulator_fp16.onnx`, `whisper_small_enc_fp16.onnx`, `dit_estimator_fp16.onnx`, `bigvgan_fp16.onnx` + 動的軸修正済み `rmvpe.onnx`）し、`models/seedvc/` へ配置・`.gitignore` に `models/seedvc/` を追加。[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js)（純JS STFT/Mel/Kaldi-fbank/RMVPE-F0デコード＋段階的ロード・解放による省メモリ推論）を実装し、[web/index.html](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/index.html) および [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に `Seed-VC (WebGPU 44.1kHz / 高品質)` モードを追加（`drawSpeakerEmbedding` 修正、マイク録音→停止で自動変換再生、ベンチマーク対応を含む）。Chrome WebGPU実機（`http://127.0.0.1:8080/`）にて参照抽出 `4.71s`・1秒ベンチマーク E2E 完了（`14.02s`, JSエラー0件）を確認。理由: 歌唱の高音域ピッチ追従・クリーンな音質・高いゼロショット話者類似度をクライアント完結のブラウザ環境で実現するため。
+- **Causal FlowVC 歌唱高音F0修正・GPU再学習・ONNX更新**: [src/models/content_f0_extractor.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/content_f0_extractor.py) のハーモニックコーム上限を `f0_max=360.0 -> 750.0 Hz`（`n_cands=128`, `persistent=False`）へ拡張し、歌唱音程を保つよう `src_log_f0` / `adapted_log_f0` を修正（[src/training/trainer.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/training/trainer.py) の `load_checkpoint` でバッファ除外対応）。RTX 4070 SUPER（CUDA）で `data/mixed`＋`data/mixed_ssl` を追加学習して `models/speaker_encoder.onnx` / `models/streaming_vc_core.onnx` を更新。
+- **Causal FlowVC こもり・クリッピング・F0跳躍修正**: 診断で判明した低域偏重（`0.08-1kHz=97.3%`, `1-3kHz=2.3%`, `peak=7.068`）に対し、[src/models/causal_flow_matching.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/causal_flow_matching.py#L99) の `base_mel` を `0.85*w_detail + 0.50*w_broad + 0.35*tgt_shape` へ調整し、[src/models/vocos_vocoder.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/vocos_vocoder.py#L327) に `0.98*tanh(audio/0.98)` リミッタを追加。また [src/models/audio_dsp.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/audio_dsp.py#L261-L265) のハーモニックコームに基音（`ratio~1.0`）強調を導入し、[src/models/content_f0_extractor.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/src/models/content_f0_extractor.py#L213) の有声閾値を `0.72` へ引き上げ。`22_flow_vc_balanced_24k.wav` で `Mel std(time)=1.392`（GT `1.399`）・`1-3kHz=4.9%`（REF `5.2%`）・`peak=0.980`・`rms=0.239` への改善および ONNX 再エクスポート（`39.50 MB`）・全5テスト合格を確認。理由: もごもご感（子音・フォルマント欠落）、`peak=7.068` 歪み、および無声/息区間でのオクターブ跳躍を解消するため。

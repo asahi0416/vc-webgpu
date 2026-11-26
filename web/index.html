@@ -28,7 +28,8 @@
         <div class="pill pill-spec">
           <label for="engine-select" style="margin-right:6px;">Engine:</label>
           <select id="engine-select" style="background:transparent;color:inherit;border:none;font:inherit;cursor:pointer;outline:none;">
-            <option value="knn" selected style="background:#0f172a;color:#f8fafc;">kNN-VC (WavLM+HiFi-GAN 16kHz / ~500ms)</option>
+            <option value="seedvc" selected style="background:#0f172a;color:#f8fafc;">Seed-VC (WebGPU 44.1kHz / 高品質)</option>
+            <option value="knn" style="background:#0f172a;color:#f8fafc;">kNN-VC (WavLM+HiFi-GAN 16kHz / ~500ms)</option>
             <option value="flow" style="background:#0f172a;color:#f8fafc;">Causal FlowVC (24kHz / 40ms)</option>
           </select>
         </div>
@@ -125,6 +126,11 @@
           <button id="btn-stop-file-vc" class="btn btn-secondary" hidden>⏹️ 再生停止</button>
           <span class="bench-note" id="file-vc-status">モデル読込後に音声ファイルを入力できます</span>
         </div>
+        <div class="btn-row" id="file-loopback-bar" hidden>
+          <button id="btn-file-play-pause" class="btn btn-secondary">⏸️ 一時停止</button>
+          <audio id="file-loopback-audio" controls loop style="flex: 1; min-width: 220px; height: 36px;"></audio>
+          <button id="btn-file-loop" class="chip active">🔁 ループ: ON</button>
+        </div>
         <div class="btn-row" id="file-vc-output" hidden>
           <audio id="file-vc-player" controls style="flex: 1; min-width: 200px; height: 36px;"></audio>
           <a id="file-vc-download" class="btn btn-secondary" download="converted.wav">💾 WAV保存</a>
@@ -185,7 +191,9 @@
     </main>
   </div>
 
+  <script src="/web/config.js"></script>
   <script src="/web/knn-engine.js"></script>
+  <script src="/web/seed-vc-engine.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>

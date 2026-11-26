@@ -324,6 +324,7 @@ class CausalVocosVocoder(nn.Module):
             - sub_f0_cut
         )
         audio_out, ola_cache_out = self.istft(total_log_mag, sin_p, cos_p, ola_cache_in)
+        audio_out = 0.98 * torch.tanh(audio_out / 0.98)
 
         slot_exc = next_exc_cache.reshape(batch_size, self.exc_slots, self.pad_len)
         slot_phase = torch.cat(

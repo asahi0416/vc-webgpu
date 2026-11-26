@@ -139,16 +139,41 @@ class CausalPitchConditioner(nn.Module):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.n_mels = n_mels
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
         self.pad_len = kernel_size - 1
         # Bins covering 0 Hz to ~1000 Hz
         freq_resolution = float(sample_rate) / float(n_fft)
         self.low_freq_bins = min(int(1000.0 / freq_resolution) + 1, n_fft // 2 + 1)
 
         comb_bank, log_f0_cands = build_harmonic_comb_bank(
-            sr=sample_rate, n_fft=n_fft, n_cands=96, f0_min=70.0, f0_max=360.0
+            sr=sample_rate, n_fft=n_fft, n_cands=128, f0_min=85.0, f0_max=750.0
         )
-        self.register_buffer("comb_bank", comb_bank.unsqueeze(0))
-        self.register_buffer("log_f0_cands", log_f0_cands)
+        self.register_buffer("comb_bank", comb_bank.unsqueeze(0), persistent=False)
+        self.register_buffer("log_f0_cands", log_f0_cands, persistent=False)
+
+        # Causal time-domain YIN buffers (non-persistent so existing checkpoints load cleanly)
+        self.yin_win = 600
+        self.yin_hop = 240
+        self.yin_min_tau = 32   # 750 Hz @ 24 kHz
+        self.yin_max_tau = 282  # 85.1 Hz @ 24 kHz
+        self.yin_n_lags = self.yin_max_tau - self.yin_min_tau + 1  # 251
+        self.yin_span = self.yin_win + self.yin_max_tau  # 882
+        self.yin_offset = max(0, n_fft - self.yin_span)  # 78
+        self.register_buffer(
+            "yin_eye",
+            torch.eye(self.yin_span, dtype=torch.float32).unsqueeze(1),
+            persistent=False,
+        )
+        lags = torch.arange(self.yin_min_tau, self.yin_max_tau + 1, dtype=torch.long).unsqueeze(1)
+        win_pos = torch.arange(self.yin_win, dtype=torch.long).unsqueeze(0)
+        yin_idx = (self.yin_span - self.yin_win - lags) + win_pos  # (251, 600)
+        self.register_buffer("yin_idx", yin_idx, persistent=False)
+        self.register_buffer(
+            "yin_tau_counts",
+            torch.arange(1, self.yin_n_lags + 1, dtype=torch.float32).view(1, 1, self.yin_n_lags),
+            persistent=False,
+        )
 
         in_dim = self.low_freq_bins + n_mels + 2
         self.in_proj = nn.Sequential(
@@ -195,6 +220,48 @@ class CausalPitchConditioner(nn.Module):
             nn.Conv1d(out_dim, out_dim, kernel_size=1),
         )
 
+    @torch.no_grad()
+    def _estimate_yin_f0(self, audio_buf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Causal time-domain YIN F0 estimator (ONNX/WebGPU friendly, no Python loops)."""
+        x_slice = audio_buf[:, self.yin_offset :]
+        frames = F.conv1d(x_slice.unsqueeze(1), self.yin_eye, stride=self.yin_hop).transpose(1, 2)
+        x_ref = frames[:, :, self.yin_span - self.yin_win : self.yin_span]  # (B, T, 600)
+        x_lag = frames[:, :, self.yin_idx]  # (B, T, 251, 600)
+        diff = x_ref.unsqueeze(2) - x_lag
+        d = (diff * diff).sum(dim=-1)  # (B, T, 251)
+
+        cum = torch.cumsum(d, dim=-1)
+        cmnd = d * self.yin_tau_counts / (cum + 1e-8)
+
+        below = cmnd < 0.22
+        is_min = (cmnd <= F.pad(cmnd[..., :-1], (1, 0), value=1.0)) & (
+            cmnd <= F.pad(cmnd[..., 1:], (0, 1), value=1.0)
+        )
+        valid_dip = below & is_min
+        has_dip = valid_dip.any(dim=-1)
+        first_idx = torch.argmax(valid_dip.to(torch.int64), dim=-1)
+        global_idx = torch.argmin(cmnd, dim=-1)
+        best_idx = torch.where(has_dip, first_idx, global_idx)
+
+        c_idx = torch.clamp(best_idx, min=1, max=self.yin_n_lags - 2)
+        y_m1 = torch.gather(cmnd, -1, (c_idx - 1).unsqueeze(-1)).squeeze(-1)
+        y_0 = torch.gather(cmnd, -1, c_idx.unsqueeze(-1)).squeeze(-1)
+        y_p1 = torch.gather(cmnd, -1, (c_idx + 1).unsqueeze(-1)).squeeze(-1)
+        denom = 2.0 * (y_m1 - 2.0 * y_0 + y_p1)
+        delta = torch.where(
+            denom.abs() > 1e-6, (y_m1 - y_p1) / denom, torch.zeros_like(denom)
+        ).clamp(-0.5, 0.5)
+
+        tau_est = float(self.yin_min_tau) + best_idx.to(cmnd.dtype) + delta
+        yin_f0_hz = float(self.sample_rate) / torch.clamp(
+            tau_est, min=float(self.yin_min_tau), max=float(self.yin_max_tau)
+        )
+        min_cmnd = torch.gather(cmnd, -1, best_idx.unsqueeze(-1)).squeeze(-1)
+        frame_rms = torch.sqrt((x_ref * x_ref).mean(dim=-1) + 1e-10)
+        yin_uv = torch.sigmoid((0.35 - min_cmnd) * 18.0) * torch.sigmoid((frame_rms - 0.005) * 400.0)
+        yin_log_f0 = torch.log(torch.clamp(yin_f0_hz, min=50.0, max=800.0)).unsqueeze(1)
+        return yin_log_f0, yin_uv.unsqueeze(1)
+
     def forward(
         self,
         mag: torch.Tensor,
@@ -202,17 +269,22 @@ class CausalPitchConditioner(nn.Module):
         pitch_shift_semitones: torch.Tensor,
         cache_in: torch.Tensor,
         spk_emb: Optional[torch.Tensor] = None,
+        audio_buf: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Estimate F0 causally via harmonic comb + ConvNeXt smoothing, adapt register, and embed."""
-        sal = torch.matmul(self.comb_bank, torch.log(torch.clamp(mag, min=1e-3)))
-        comb_probs = F.softmax(sal * 35.0, dim=1)
-        comb_log_f0 = (comb_probs * self.log_f0_cands).sum(dim=1, keepdim=True)
-        max_sal, _ = sal.max(dim=1, keepdim=True)
+        """Estimate F0 causally via YIN (or harmonic comb fallback) + ConvNeXt smoothing."""
         low_band_energy = mag[:, 2:60, :].mean(dim=1, keepdim=True)
-        # Scale-tolerant voicing gate so quiet mic levels stay voiced while mid-vowel harmonics hold
-        comb_uv = torch.sigmoid((max_sal - 0.42) * 8.0) * torch.sigmoid(
-            (low_band_energy - 0.025) * 80.0
-        )
+        if audio_buf is not None:
+            comb_log_f0, yin_uv = self._estimate_yin_f0(audio_buf)
+            comb_uv = yin_uv * torch.sigmoid((low_band_energy - 0.015) * 100.0)
+        else:
+            sal = torch.matmul(self.comb_bank, torch.log(torch.clamp(mag, min=1e-3)))
+            comb_probs = F.softmax(sal * 35.0, dim=1)
+            comb_log_f0 = (comb_probs * self.log_f0_cands).sum(dim=1, keepdim=True)
+            max_sal, _ = sal.max(dim=1, keepdim=True)
+            # Scale-tolerant voicing gate: reject weak/noisy consonant frames that cause octave jumps
+            comb_uv = torch.sigmoid((max_sal - 0.72) * 10.0) * torch.sigmoid(
+                (low_band_energy - 0.025) * 80.0
+            )
         comb_log_norm = (comb_log_f0 - math.log(180.0)) * comb_uv
 
         low_mag = torch.log(torch.clamp(mag[:, : self.low_freq_bins, :], min=1e-5))
@@ -228,9 +300,12 @@ class CausalPitchConditioner(nn.Module):
 
         pred = self.f0_head(h)  # (B, 3, T)
         src_base_log_f0 = self.log_base_min + torch.sigmoid(pred[:, 2:3, :]) * self.log_base_range
-        comb_dev = (comb_log_f0 - src_base_log_f0) * comb_uv
-        # Preserve expressive F0 inflection while keeping causal ConvNeXt denoising
-        src_log_f0 = src_base_log_f0 + 0.45 * comb_dev + 0.55 * (0.65 * torch.tanh(pred[:, 0:1, :]))
+        # Track harmonic comb F0 faithfully across singing & speech (70-750 Hz) with tiny causal smoothing
+        src_log_f0 = (
+            comb_uv * comb_log_f0
+            + (1.0 - comb_uv) * src_base_log_f0
+            + 0.06 * torch.tanh(pred[:, 0:1, :])
+        )
         uv = comb_uv * torch.sigmoid(pred[:, 1:2, :] + 0.5)
 
         if spk_emb is not None:
@@ -243,11 +318,10 @@ class CausalPitchConditioner(nn.Module):
                 min=self.log_base_min,
                 max=math.log(340.0),
             )
-            prosody = 0.65 * torch.tanh((src_log_f0 - src_base_log_f0) / 0.65)
-            adapted_log_f0 = tgt_base_log_f0 + prosody
         else:
             tgt_base_log_f0 = src_base_log_f0
-            adapted_log_f0 = src_log_f0
+        # Preserve input melody/pitch at 0 st (user controls octave/key via pitch_shift_semitones)
+        adapted_log_f0 = src_log_f0
 
         self.last_src_f0_hz = torch.exp(src_log_f0)
         self.last_src_base_log_f0 = src_base_log_f0

@@ -1,0 +1,14 @@
+# Ignore huge model files and local training data from Vercel deployment
+models/
+checkpoints/
+data/
+third_party/
+tests/
+ios/
+outputs/
+.git/
+*.pt
+*.onnx
+*.bin
+*.tar.gz
+*.zip

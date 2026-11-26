@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 models/*.onnx
-checkpoints/*.pt
+checkpoints/
+outputs/
 data/
 .venv/
 venv/
 third_party/
 models/knn/
+models/seedvc/

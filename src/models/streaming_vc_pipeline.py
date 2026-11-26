@@ -77,10 +77,16 @@ class StreamingVCCore(nn.Module):
             stft_cache_out, content_cache_out, f0_cache_out,
             flow_cache_out, vocoder_cache_out, ola_cache_out
         """
+        audio_buf = torch.cat([stft_cache_in.squeeze(1), audio_chunk], dim=-1)
         log_mel, mag, stft_cache_out = self.mel_extractor(audio_chunk, stft_cache_in)
         content_feat, content_cache_out = self.content_encoder(log_mel, content_cache_in)
         f0_feat, shifted_f0, uv, f0_cache_out = self.pitch_conditioner(
-            mag, log_mel, pitch_shift_semitones, f0_cache_in, spk_emb=spk_emb
+            mag,
+            log_mel,
+            pitch_shift_semitones,
+            f0_cache_in,
+            spk_emb=spk_emb,
+            audio_buf=audio_buf,
         )
 
         cond_feat = content_feat + f0_feat

@@ -31,9 +31,9 @@
   const REF_EMIT = 40; // frames emitted per reference window
   const MAX_REF_SECONDS = 60;
 
-  const WAVLM_FP32_URL = "/models/knn/wavlm6_w1500.onnx";
-  const WAVLM_INT8_URL = "/models/knn/wavlm6_w1500_int8mm.onnx";
-  const HIFIGAN_URL = "/models/knn/hifigan_dyn.onnx";
+  function getKnnModelUrl(filename) {
+    return (window.VC_CONFIG && window.VC_CONFIG.getModelUrl(`knn/${filename}`)) || `/models/knn/${filename}`;
+  }
 
   function trimSilence(x, thrDb) {
     const frame = HOP;
@@ -299,9 +299,9 @@
         try {
           const gpuOpts = { executionProviders: ["webgpu", "wasm"], graphOptimizationLevel: "all" };
           if (onStatus) onStatus("WavLM (FP32, WebGPU) 読込中...");
-          this.wavlm = await ort.InferenceSession.create(WAVLM_FP32_URL, gpuOpts);
+          this.wavlm = await ort.InferenceSession.create(getKnnModelUrl("wavlm6_w1500.onnx"), gpuOpts);
           if (onStatus) onStatus("HiFi-GAN (WebGPU) 読込中...");
-          this.hifigan = await ort.InferenceSession.create(HIFIGAN_URL, gpuOpts);
+          this.hifigan = await ort.InferenceSession.create(getKnnModelUrl("hifigan_dyn.onnx"), gpuOpts);
           this.backendLabel = "WebGPU";
         } catch (err) {
           console.warn("WebGPU kNN-VC init failed, falling back to WASM int8:", err);
@@ -312,9 +312,9 @@
       if (!useWebGpu) {
         const wasmOpts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
         if (onStatus) onStatus("WavLM (int8, WASM) 読込中...");
-        this.wavlm = await ort.InferenceSession.create(WAVLM_INT8_URL, wasmOpts);
+        this.wavlm = await ort.InferenceSession.create(getKnnModelUrl("wavlm6_w1500_int8mm.onnx"), wasmOpts);
         if (onStatus) onStatus("HiFi-GAN (WASM) 読込中...");
-        this.hifigan = await ort.InferenceSession.create(HIFIGAN_URL, wasmOpts);
+        this.hifigan = await ort.InferenceSession.create(getKnnModelUrl("hifigan_dyn.onnx"), wasmOpts);
         this.backendLabel = `WASM ${ort.env.wasm.numThreads}T`;
       }
 

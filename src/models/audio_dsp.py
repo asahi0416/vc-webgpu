@@ -258,9 +258,10 @@ def build_harmonic_comb_bank(
     comb = torch.zeros(n_cands, n_freqs, dtype=torch.float32)
     for idx, f0 in enumerate(f0_cands):
         ratio = freqs / f0
-        mask = (ratio >= 0.6) & (ratio <= 6.5)
-        weight = torch.pow(torch.clamp(ratio, min=0.5), -0.6) * mask.to(torch.float64)
-        w_cos = torch.cos(2.0 * math.pi * ratio) * weight
+        mask = (ratio >= 0.65) & (ratio <= 6.5)
+        weight = torch.pow(torch.clamp(ratio, min=0.65), -0.6) * mask.to(torch.float64)
+        fund_boost = 1.0 + 1.5 * torch.exp(-((ratio - 1.0) / 0.14) ** 2)
+        w_cos = torch.cos(2.0 * math.pi * ratio) * weight * fund_boost
         pos = torch.clamp(w_cos, min=0.0)
         neg = torch.clamp(-w_cos, min=0.0)
         comb[idx] = (pos / (pos.sum() + 1e-6) - neg / (neg.sum() + 1e-6)).to(torch.float32)

@@ -431,7 +431,10 @@ class VCTrainer:
 
     def load_checkpoint(self, path: str | Path) -> Dict[str, object]:
         payload = torch.load(str(path), map_location=self.device)
-        self.model.load_state_dict(payload["model_state"])
+        state = dict(payload["model_state"])
+        state.pop("core.pitch_conditioner.comb_bank", None)
+        state.pop("core.pitch_conditioner.log_f0_cands", None)
+        self.model.load_state_dict(state, strict=False)
         if "optimizer_state" in payload:
             self.optimizer.load_state_dict(payload["optimizer_state"])
         if "scheduler_state" in payload:

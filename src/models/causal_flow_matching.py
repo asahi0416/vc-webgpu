@@ -96,7 +96,7 @@ class CausalFlowMatchingDecoder(nn.Module):
         voice_gate = torch.sigmoid((src_frame_mean + 8.3) * 2.0)
         voiced_norm = -4.8 + 1.2 * torch.tanh((src_frame_mean + 5.6) / 1.8)
         norm_frame_mean = src_frame_mean * (1.0 - voice_gate) + voice_gate * voiced_norm
-        return norm_frame_mean + 0.12 * w_detail + voice_gate * tgt_shape
+        return norm_frame_mean + 0.15 * w_detail + voice_gate * tgt_shape
 
     def forward_velocity(
         self,
