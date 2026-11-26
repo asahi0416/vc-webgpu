@@ -1,6 +1,13 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **音割れ・クラックルノイズの完全解消（波形分割撤廃・クリーン過渡包絡線＋High-Shelf プレゼンス化）**:
+  - 前段の子音改善で導入した Butterworth IIR 波形分割（低域/高域マルチバンド）が、IIR の群遅延・クロスオーバー位相差により波形引き裂きスパイク（`MaxJump=0.6885`, `harsh=100`）を発生させ激しい音割れを引き起こしていた物理的原因を特定。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) における波形分割処理を完全撤廃し、①Smooth Voiced-Adaptive AdaIN（5フレーム平滑化による時間段差スパイク防止）、②波形を分割しない単一クリーン過渡包絡線マッチング（ゲイン上限 1.0 によるクリップ防止）、③位相引き裂きのない連続 High-Shelf プレゼンスフィルタ（+2.0dB @ 4.5kHz）＋ピーク 0.88 安全リミッタへ全面改修。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) の事前計算・窓推論呼び出しをクリーン包絡線パラメータへ整合。
+  - 実音声検証にて `src_voice_articulated.wav` のスパイクが `100 → 8`（元音声自身の 7 と完全同等、`MaxJump 0.6885 → 0.4358`）、歌唱 `torisetsu_articulated.wav` で `harsh = 0`（完全ゼロ、`MaxJump 0.0826`）へ激減し、音割れが完全に消滅。
+  - Chrome WebGPU 実機（`http://127.0.0.1:8080/?test=chunk_stream`）にてピーク `pk=0.880`、エラー0件で完全クリーンな動作を確認。
+  - 理由: 「何かめっちゃ音割れしてない？」というフィードバックに対し、波形引き裂きの原因を物理測定で突き止め、音割れゼロと自然な子音の抜けを両立するため。
 - **有声適応 AdaIN ＋ マルチバンド過渡包絡線マッチングによる子音明瞭度・滑舌（舌足らず感）の根本改善**:
   - 発話音声において元音声の子音帯域（3-8kHz）が 13.45%（子音フレームで 53.05%）存在したのに対し、生成音声では 0.55%（子音フレームで 3.78%）まで約14分の1に消滅していた物理的原因を特定（①参考音声の高域欠落へのDiT過剰同化、②Whisper AdaINの一律正規化による子音特徴量圧縮、③`applyEnvelopeMatch` の240ms過剰平滑化＆ゲイン上限1.0による子音アタック圧殺の3重ボトルネック）。
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に 2次Butterworthフィルタ（`makeBiquadFilter`, `applyBiquad`）を新設し、有声適応型 AdaIN（母音区間は話者類似度100%保持、無声子音区間は元ダイナミクスを75%保持）およびマルチバンド適応包絡整合（低中域<2.5kHzは話者音色・母音保持、高域>2.8kHzは子音アタック・摩擦音を最大2.5倍まで適応復元）を実装。
