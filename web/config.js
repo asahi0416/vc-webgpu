@@ -14,12 +14,16 @@
   const customBase = params.get("model_base");
   const customHf = params.get("hf_repo");
 
+  const isLocalHost =
+    typeof location !== "undefined" &&
+    (location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname === "[::1]");
+
   let base = "/models";
   if (customBase) {
     base = customBase.replace(/\/+$/, "");
   } else if (customHf) {
     base = `https://huggingface.co/${customHf.replace(/^\/+|\/+$/g, "")}/resolve/main/models`;
-  } else if (window.__VC_DEFAULT_HF_REPO__) {
+  } else if (!isLocalHost && window.__VC_DEFAULT_HF_REPO__) {
     base = `https://huggingface.co/${window.__VC_DEFAULT_HF_REPO__.replace(/^\/+|\/+$/g, "")}/resolve/main/models`;
   }
 

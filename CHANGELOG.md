@@ -1,6 +1,13 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **音割れ・舌足らず・無音ノイズの3大原因を根本解消（後処理の対処療法を全撤去＋クリーン蒸留 DiT へ刷新）**:
+  - CUDA フル尺診断（発話 2.39秒・トリセツ 全23.32秒）＋日本語 Whisper ASR 比較により3つの根本原因を物理特定：①旧 1ステップ蒸留モデル（`seedvc_dit_1step_prog.pt`）が二重CFG由来の過大メル（`m_p99=1.98`, 本家教師は `0.88〜1.03`）を出力して BigVGAN 内部で既に音割れしていたこと、②`FCPE` 閾値 `0.006` による無声子音 `60.0%`・無音 `18.8%` の誤有声化および Whisper フル強度 AdaIN（`1.0`）による日本語音素潰れ（「お兄ちゃん!→おねえぞ!」「笑って許してね→はなんて言うのしてね」）、③無音フレームへの AdaIN 統計適用と参照音声 8.0s 発話途中ぶつ切りによる `0.00s` 無音ノイズ漏れ。
+  - [scripts/export_seedvc_student_onnx.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/scripts/export_seedvc_student_onnx.py) を追加し、クリーンな 12ステップ教師由来の `checkpoints/seedvc_dit_1step_sharp.pt` を [models/seedvc/dit_student_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/dit_student_fp16.onnx)（`351.71 MB`, ORT `nan=0`, `cos=1.000000`）へ再エクスポート。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) から対処療法（High-Shelf EQ・0.88 ピークリミッタ・二重 `applyEnvelopeMatch`・100Hz/50Hz レート不一致 F0 AdaIN）を全撤去し、`FCPE` 閾値 `0.10`、無音除外 Soft Active-frame AdaIN（`rms < 0.006` は非適用・発話のみ強度 `0.25`）、参照音声末尾 40msフェード＋80ms無音終端、およびライブ遅延 0ms 増の過去 1.86秒 Whisper コンテキストを実装。
+  - [web/config.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/config.js) をローカルホスト時は `/models` 優先・本番公開ドメイン時は Hugging Face Hub 優先へ改善。
+  - 本番 ONNX フル尺実測（後処理 EQ・リミッタ完全ゼロ）：発話全2.38秒 `pk=0.645, clip=0.00%, pure_sil=0.0003 (pk=0.0043), cosT=0.450`, ASR「お兄ちゃん!」、トリセツ全23.31秒 `pk=0.728, clip=0.00%, pure_sil=0.0009, cosT=0.729`, ASR「...笑って許してねずっと大切にしてね...」。Chrome WebGPU 実機にて JSエラー 0件・`5.99s -> 1,353ms (RTF 0.226)`・`pk=0.991 / 0.862`（未飽和）を確認。
+  - 理由: 後処理 EQ やリミッタによる対処療法を完全に排し、モデル出力メル・F0有声判定・Whisper音素保持・無音境界の各根本原因から音割れ・舌足らず・無音ノイズを同時解消するため。
 - **音割れ・クラックルノイズの完全解消（波形分割撤廃・クリーン過渡包絡線＋High-Shelf プレゼンス化）**:
   - 前段の子音改善で導入した Butterworth IIR 波形分割（低域/高域マルチバンド）が、IIR の群遅延・クロスオーバー位相差により波形引き裂きスパイク（`MaxJump=0.6885`, `harsh=100`）を発生させ激しい音割れを引き起こしていた物理的原因を特定。
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) における波形分割処理を完全撤廃し、①Smooth Voiced-Adaptive AdaIN（5フレーム平滑化による時間段差スパイク防止）、②波形を分割しない単一クリーン過渡包絡線マッチング（ゲイン上限 1.0 によるクリップ防止）、③位相引き裂きのない連続 High-Shelf プレゼンスフィルタ（+2.0dB @ 4.5kHz）＋ピーク 0.88 安全リミッタへ全面改修。

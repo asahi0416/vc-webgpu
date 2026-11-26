@@ -167,42 +167,6 @@
     return `nan=${nNan}/${arr.length} [${mn.toFixed(2)},${mx.toFixed(2)}]`;
   }
 
-  // Clean High-Shelf filter (Biquad) for smooth high-frequency presence without phase cancellation
-  function makeHighShelfFilter(fc = 4500, boostDb = 2.0, fs = SR_OUT) {
-    const A = Math.pow(10.0, boostDb / 40.0);
-    const w0 = (2.0 * Math.PI * fc) / fs;
-    const cosW0 = Math.cos(w0);
-    const sinW0 = Math.sin(w0);
-    const alpha = (sinW0 / 2.0) * Math.sqrt(2.0);
-    const b0 = A * ((A + 1) + (A - 1) * cosW0 + 2 * Math.sqrt(A) * alpha);
-    const b1 = -2 * A * ((A - 1) + (A + 1) * cosW0);
-    const b2 = A * ((A + 1) + (A - 1) * cosW0 - 2 * Math.sqrt(A) * alpha);
-    const a0 = (A + 1) - (A - 1) * cosW0 + 2 * Math.sqrt(A) * alpha;
-    const a1 = 2 * ((A - 1) - (A + 1) * cosW0);
-    const a2 = (A + 1) - (A - 1) * cosW0 - 2 * Math.sqrt(A) * alpha;
-    return {
-      b0: b0 / a0,
-      b1: b1 / a0,
-      b2: b2 / a0,
-      a1: a1 / a0,
-      a2: a2 / a0,
-    };
-  }
-
-  function applyBiquadInPlace(wav, coeffs) {
-    const { b0, b1, b2, a1, a2 } = coeffs;
-    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-    for (let i = 0; i < wav.length; i++) {
-      const x0 = wav[i];
-      const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-      wav[i] = y0;
-      x2 = x1;
-      x1 = x0;
-      y2 = y1;
-      y1 = y0;
-    }
-  }
-
   class SeedVcEngine {
     static SAMPLE_RATE = SR_OUT;
 
@@ -751,7 +715,7 @@
               mel: new this.ort.Tensor("float32", mel, [1, nFrames, 128]),
             });
             const logits = res[sess.outputNames[0]].data;
-            return this.decodeFcpeF0(logits, nFrames, 0.006);
+            return this.decodeFcpeF0(logits, nFrames, 0.10);
           }
           const fullF0 = new Float32Array(nFrames);
           for (let off = 0; off < nFrames; off += maxWin) {
@@ -761,7 +725,7 @@
               mel: new this.ort.Tensor("float32", slice, [1, len, 128]),
             });
             const logits = res[sess.outputNames[0]].data;
-            const partF0 = this.decodeFcpeF0(logits, len, 0.006);
+            const partF0 = this.decodeFcpeF0(logits, len, 0.10);
             fullF0.set(partF0, off);
             await new Promise((r) => setTimeout(r, 0));
           }
@@ -832,8 +796,8 @@
       return { mean, std };
     }
 
-    applyWhisperAdaIN(data, frames, dim = 768, wav16 = null, useStreamEma = false, f0 = null) {
-      if (!this.ref || !this.ref.sOriMean || !this.ref.sOriStd || frames <= 1) return data;
+    applyWhisperAdaIN(data, frames, dim = 768, wav16 = null, useStreamEma = false, strength = 0.25) {
+      if (!this.ref || !this.ref.sOriMean || !this.ref.sOriStd || frames <= 1 || strength <= 0) return data;
       let { mean: mSrc, std: sSrc } = this.computeFeatureStats(data, frames, dim, wav16);
       if (useStreamEma) {
         if (!this.streamAdaMean || !this.streamAdaStd || this.streamAdaMean.length !== dim) {
@@ -851,28 +815,30 @@
       const mOri = this.ref.sOriMean;
       const sOri = this.ref.sOriStd;
 
-      // Smooth Voiced-Adaptive AdaIN: 平滑化された有声度合いで時間方向の不連続・段差スパイクを完全防止
-      // 母音区間(alpha=1.0)は目標話者の音色を100%保持、無声子音区間(alpha=0.4)は元音声の子音ダイナミクスを自然に保持
-      const alphaArr = new Float32Array(frames);
-      for (let t = 0; t < frames; t++) {
-        alphaArr[t] = f0 && t < f0.length && f0[t] > 40.0 ? 1.0 : 0.40;
-      }
-      const smoothAlpha = new Float32Array(frames);
-      for (let t = 0; t < frames; t++) {
-        const a = Math.max(0, t - 2);
-        const b = Math.min(frames - 1, t + 2);
-        let acc = 0;
-        for (let k = a; k <= b; k++) acc += alphaArr[k];
-        smoothAlpha[t] = acc / (b - a + 1);
-      }
-
+      // Silence-protected Soft Active-frame AdaIN:
+      // Keeps silent frames (rms < 0.006) completely untouched (zero silence noise injection)
+      // and applies soft strength (0.25) on active speech so Japanese phonemes never distort/lisp.
+      const hop = 320; // 20ms at 16kHz -> exact 50Hz Whisper frame rate
       const out = new Float32Array(data.length);
       for (let t = 0; t < frames; t++) {
+        let gate = 1.0;
+        if (wav16 && wav16.length >= hop) {
+          const s = t * hop;
+          const e = Math.min(wav16.length, s + hop);
+          let sq = 0;
+          for (let i = s; i < e; i++) sq += wav16[i] * wav16[i];
+          const rms = e > s ? Math.sqrt(sq / (e - s)) : 0;
+          gate = Math.max(0.0, Math.min(1.0, (rms - 0.006) / 0.012));
+        }
+        const alpha = strength * gate;
         const off = t * dim;
-        const alpha = smoothAlpha[t];
-        for (let d = 0; d < dim; d++) {
-          const adainVal = ((data[off + d] - mSrc[d]) / sSrc[d]) * sOri[d] + mOri[d];
-          out[off + d] = data[off + d] * (1.0 - alpha) + adainVal * alpha;
+        if (alpha <= 1e-6) {
+          out.set(data.subarray(off, off + dim), off);
+        } else {
+          for (let d = 0; d < dim; d++) {
+            const adainVal = ((data[off + d] - mSrc[d]) / sSrc[d]) * sOri[d] + mOri[d];
+            out[off + d] = data[off + d] * (1.0 - alpha) + adainVal * alpha;
+          }
         }
       }
       return out;
@@ -897,8 +863,17 @@
       const trimmedPrompt = audioFloat32.subarray(0, maxPromptSamples);
       const trimmedStyle = audioFloat32.subarray(0, maxStyleSamples);
 
-      const ref44 = await resampleAudio(trimmedPrompt, sampleRate, SR_OUT);
-      const ref16 = await resampleAudio(trimmedPrompt, sampleRate, SR_16K);
+      const rawRef44 = await resampleAudio(trimmedPrompt, sampleRate, SR_OUT);
+      // Append 40ms smooth fade-out + 80ms clean silence tail so DiT never leaks
+      // mid-utterance voice from the prompt boundary into frame 0 of converted audio.
+      const fadeSamples = Math.min(rawRef44.length, Math.round(SR_OUT * 0.04));
+      const padSamples = Math.round(SR_OUT * 0.08);
+      const ref44 = new Float32Array(rawRef44.length + padSamples);
+      ref44.set(rawRef44, 0);
+      for (let i = 0; i < fadeSamples; i++) {
+        ref44[rawRef44.length - fadeSamples + i] *= 1.0 - i / fadeSamples;
+      }
+      const ref16 = await resampleAudio(ref44, SR_OUT, SR_16K);
       const style16 =
         maxStyleSamples > maxPromptSamples
           ? await resampleAudio(trimmedStyle, sampleRate, SR_16K)
@@ -981,16 +956,16 @@
       const src16 = sampleRate === SR_OUT ? resample44to16Fast(src44) : await resampleAudio(audioFloat32, sampleRate, SR_16K);
 
       const { nFrames: T_src } = this.computeBigvganMel(src44);
-      const tY0 = performance.now();
-      const F0_alt = await this.runRmvpe(src16, "変換元", onProgress);
-      const tYinMs = performance.now() - tY0;
-
       const tW0 = performance.now();
       const S_alt = await this.runWhisper(src16, "変換元", onProgress);
       if (opts.useAdain !== false) {
-        S_alt.data = this.applyWhisperAdaIN(S_alt.data, S_alt.frames, 768, src16, Boolean(opts.isStream), F0_alt);
+        S_alt.data = this.applyWhisperAdaIN(S_alt.data, S_alt.frames, 768, src16, Boolean(opts.isStream), opts.adainStrength ?? 0.25);
       }
       const tWhisperMs = performance.now() - tW0;
+
+      const tY0 = performance.now();
+      const F0_alt = await this.runRmvpe(src16, "変換元", onProgress);
+      const tYinMs = performance.now() - tY0;
 
       if (pitchShift !== 0) {
         const factor = Math.pow(2.0, pitchShift / 12.0);
@@ -1006,19 +981,21 @@
         ylens: new this.ort.Tensor("int64", BigInt64Array.from([BigInt(T_src)]), [1]),
         f0: new this.ort.Tensor("float32", F0_alt, [1, F0_alt.length]),
       });
-      const cond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      let cond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      let ditFrames = T_src;
+      const ditTailFrames = Number(opts.ditTailFrames || 0);
+      if (ditTailFrames > 0 && ditTailFrames < T_src) {
+        cond = cond.slice((T_src - ditTailFrames) * 768);
+        ditFrames = ditTailFrames;
+      }
       const { outWav, tDitMs, tBigvganMs, rms, peak } = await this.runDitAndBigvgan(
         cond,
-        T_src,
+        ditFrames,
         nSteps,
         cfgRate,
         onProgress,
         maxPromptFrames
       );
-
-      // Clean single-band transient envelope match + gentle High-Shelf presence
-      const srcEnv = this.computeSmoothEnv(src44, T_src, 512, 10);
-      this.applyEnvelopeMatch(outWav, srcEnv, 0);
 
       return {
         audio: outWav,
@@ -1201,7 +1178,7 @@
       }
       const f0 = await this.runRmvpe(src16, "変換元全体", onProgress);
       if (opts.useAdain !== false) {
-        sData = this.applyWhisperAdaIN(sData, sFrames, 768, src16, false, f0);
+        sData = this.applyWhisperAdaIN(sData, sFrames, 768, src16, false, opts.adainStrength ?? 0.25);
       }
 
       if (pitchShift !== 0) {
@@ -1245,12 +1222,12 @@
       return smooth;
     }
 
-    applyEnvelopeMatch(out, srcEnv, startFrame = 0, presenceBoostDb = 2.0) {
+    applyEnvelopeMatch(out, srcEnv, startFrame = 0) {
       const hop = 512;
       const nFrames = Math.ceil(out.length / hop);
       if (nFrames <= 0 || !srcEnv) return;
 
-      const outEnv = this.computeSmoothEnv(out, nFrames, hop, 6);
+      const outEnv = this.computeSmoothEnv(out, nFrames, hop, 10);
       const gains = new Float32Array(nFrames);
       for (let f = 0; f < nFrames; f++) {
         const sIdx = Math.min(srcEnv.length - 1, startFrame + f);
@@ -1261,12 +1238,12 @@
         } else if (oRms < 0.015) {
           gains[f] = 1.0;
         } else {
-          // Linear gain capped at 1.0 to prevent any clipping or harsh distortion
+          // Purely linear gain (capped at 1.0) to match source dynamics;
+          // clean 1-step DiT outputs clip=0.00% natively without EQ/limiter hacks.
           gains[f] = Math.min(1.0, sRms / oRms);
         }
       }
 
-      // Sample-accurate linear gain interpolation (zero clicks/spikes)
       for (let f = 0; f < nFrames; f++) {
         const g0 = gains[f];
         const g1 = f + 1 < nFrames ? gains[f + 1] : g0;
@@ -1277,24 +1254,6 @@
           const t = i / len;
           out[s + i] *= g0 + (g1 - g0) * t;
         }
-      }
-
-      // Smooth High-Shelf presence EQ (+2.0dB @ 4.5kHz) without splitting the waveform
-      // Preserves 100% phase alignment and eliminates harsh crossover tear
-      if (presenceBoostDb > 0) {
-        const hsCoeffs = makeHighShelfFilter(4500, presenceBoostDb, SR_OUT);
-        applyBiquadInPlace(out, hsCoeffs);
-      }
-
-      // Peak safety limiter (headroom capped at 0.88 to prevent DAC distortion)
-      let pk = 0;
-      for (let i = 0; i < out.length; i++) {
-        const av = Math.abs(out[i]);
-        if (av > pk) pk = av;
-      }
-      if (pk > 0.88) {
-        const scale = 0.88 / pk;
-        for (let i = 0; i < out.length; i++) out[i] *= scale;
       }
     }
 
@@ -1368,11 +1327,12 @@
     }
 
     resetStream() {
-      this.streamCtxSamples = 48 * 512;     // 24,576 samples (~557ms left context, 0ms added latency)
-      this.streamChunkSamples = 40 * 512;   // 20,480 samples (~464ms low-latency hop)
-      this.streamRightSamples = 8 * 512;    // 4,096 samples (~93ms right context, discarded from output)
-      this.streamXfadeSamples = 1024;       // ~23ms SOLA phase-aligned Hann crossfade
-      this.streamLeftCtx = new Float32Array(this.streamCtxSamples);
+      this.streamWhisperCtxSamples = 160 * 512; // 81,920 samples (~1.86s past context for Whisper/FCPE, 0ms added latency)
+      this.streamCtxSamples = 48 * 512;         // 24,576 samples (~557ms left context for DiT/BigVGAN)
+      this.streamChunkSamples = 40 * 512;       // 20,480 samples (~464ms low-latency hop)
+      this.streamRightSamples = 8 * 512;        // 4,096 samples (~93ms right context, discarded from output)
+      this.streamXfadeSamples = 1024;           // ~23ms SOLA phase-aligned Hann crossfade
+      this.streamLeftCtx = new Float32Array(this.streamWhisperCtxSamples);
       this.streamPrevTail = null;
       this.streamAutoSemi = null;
       this.streamAdaMean = null;
@@ -1401,11 +1361,11 @@
           }
           this.streamPrevTail = null;
         }
-        if (nNew >= this.streamCtxSamples) {
-          this.streamLeftCtx.set(newChunk44.subarray(nNew - this.streamCtxSamples));
+        if (nNew >= this.streamWhisperCtxSamples) {
+          this.streamLeftCtx.set(newChunk44.subarray(nNew - this.streamWhisperCtxSamples));
         } else {
           this.streamLeftCtx.copyWithin(0, nNew);
-          this.streamLeftCtx.set(newChunk44, this.streamCtxSamples - nNew);
+          this.streamLeftCtx.set(newChunk44, this.streamWhisperCtxSamples - nNew);
         }
         return {
           audio: silent,
@@ -1418,16 +1378,17 @@
         };
       }
 
-      // Always pad to fixed 96 frames (48 left + 40 chunk + 8 right) so WebGPU never recompiles shaders
-      // and output + crossfade tail stay >= 8 frames (93ms) away from right-edge BigVGAN/Whisper artifacts.
+      // Feed 1.86s past context to Whisper/FCPE (0ms added latency) so Japanese phonemes stay crisp,
+      // then slice only the tail 96 frames (L48/C40/R8) for fast fixed-shape DiT/BigVGAN inference.
+      const whCtxLen = this.streamWhisperCtxSamples;
       const ctxLen = this.streamCtxSamples;
-      const totalLen = ctxLen + this.streamChunkSamples + this.streamRightSamples;
+      const totalLen = whCtxLen + this.streamChunkSamples + this.streamRightSamples;
       const comb = new Float32Array(totalLen);
       comb.set(this.streamLeftCtx, 0);
-      comb.set(newChunk44, ctxLen);
+      comb.set(newChunk44, whCtxLen);
       if (rightCtx && rightCtx.length > 0 && nNew === this.streamChunkSamples) {
         const rLen = Math.min(this.streamRightSamples, rightCtx.length);
-        comb.set(rightCtx.subarray(0, rLen), ctxLen + this.streamChunkSamples);
+        comb.set(rightCtx.subarray(0, rLen), whCtxLen + this.streamChunkSamples);
       }
 
       const conv = await this.convertAudio(
@@ -1438,6 +1399,7 @@
           steps: opts.steps ?? 1,
           cfgRate: opts.cfgRate ?? 0.0,
           maxPromptFrames: opts.maxPromptFrames ?? 258,
+          ditTailFrames: 96,
           isStream: true,
         },
         onProgress
@@ -1491,11 +1453,11 @@
         this.streamPrevTail = null;
       }
 
-      if (nNew >= this.streamCtxSamples) {
-        this.streamLeftCtx.set(newChunk44.subarray(nNew - this.streamCtxSamples));
+      if (nNew >= this.streamWhisperCtxSamples) {
+        this.streamLeftCtx.set(newChunk44.subarray(nNew - this.streamWhisperCtxSamples));
       } else {
         this.streamLeftCtx.copyWithin(0, nNew);
-        this.streamLeftCtx.set(newChunk44, this.streamCtxSamples - nNew);
+        this.streamLeftCtx.set(newChunk44, this.streamWhisperCtxSamples - nNew);
       }
 
       const chunkEnv = this.computeSmoothEnv(newChunk44, Math.ceil(nNew / 512), 512, 10);
