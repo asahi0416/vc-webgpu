@@ -630,6 +630,7 @@
       const mono = await decodeAudioFileToMono(file, targetRate);
       await extractSpeakerEmbedding(mono, file.name, true, targetRate);
     } catch (err) {
+      el.refStatus.textContent = `抽出エラー: ${err.message}`;
       log(`ファイル読込エラー: ${err.message}`);
     }
   }
@@ -1287,8 +1288,13 @@
   });
 
   el.btnTestRef.addEventListener("click", async () => {
-    const synth = generateSyntheticReferenceAudio(REF_SECONDS, 220.0);
-    await extractSpeakerEmbedding(synth, "内蔵テスト音声 (220Hz)");
+    try {
+      const synth = generateSyntheticReferenceAudio(REF_SECONDS, 220.0);
+      await extractSpeakerEmbedding(synth, "内蔵テスト音声 (220Hz)");
+    } catch (err) {
+      el.refStatus.textContent = `抽出エラー: ${err.message}`;
+      log(`テスト参照抽出エラー: ${err.message}`);
+    }
   });
 
   el.pitchSlider.addEventListener("input", (ev) => {
@@ -1335,7 +1341,11 @@
   el.engineSelect.addEventListener("change", async () => {
     if (state.isStreaming) await stopRealtimeVC();
     if (state.isConvertingFile) await stopFilePlayback();
+    const prevEngine = state.engine;
     state.engine = el.engineSelect.value || "knn";
+    if (prevEngine === "seedvc" && state.engine !== "seedvc" && state.seedvcEngine && state.seedvcEngine.lowMemoryMode) {
+      await state.seedvcEngine.dispose();
+    }
     const labels = {
       seedvc: "Seed-VC (WebGPU 44.1kHz)",
       knn: "kNN-VC (WavLM+HiFi-GAN)",

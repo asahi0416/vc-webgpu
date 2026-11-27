@@ -1,6 +1,15 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **iPhone Safari の OOM リロード対策：使い終わった ONNX セッションの自動解放・省メモリモードを実装**:
+  - iPhone Safari で `WebGPU シェーダ事前コンパイル中` に `未抽出`（HTML初期状態）へ戻る原因が、6モデル同時常駐（計 `1,211 MB`・展開ピーク約 2.5〜3 GB）による iOS WebKit の Jetsam メモリ制限タブリロードであることを特定。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に以下を実装：
+    - 全端末で参照登録1回きりの `campplus_fp16.onnx` を使用直後に即 `release()`。
+    - iOS / モバイル / 低メモリ端末（および手動 `?low_mem=1`）を自動検出し、`[省メモリ]` モードでは `setReference` 時の重い `warmupShaders`（DiT 335MB + BigVGAN 468MB）をスキップ、さらに推論各ステージ（Whisper / FCPE / LengthRegulator / DiT / BigVGAN）終了ごとに使い終わったセッションを即 `release()`＋次モデル読込前に他セッションを解放して同時占有を単体最大 `468 MB` 以下（約3分の1以下）へ抑制。
+    - `load()` で `navigator.gpu.requestAdapter()` を厳密検証するよう改善し、PC 側の `warmupShaders` も `try/catch` で保護（失敗しても参照登録済み状態を維持）。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に `#btn-test-ref` / ファイル抽出時の `try/catch` エラー表示（`#ref-status`・`#app-log`）と、省メモリモード時のエンジン切替時 `dispose()` を追加（UI変更ゼロ）。
+  - Chrome WebGPU 実機検証（JSエラー 0件）：`?low_mem=1` で参照抽出 `3.25s`・E2E ベンチマーク完走（出力 `rms=0.133, peak=0.349` 完全一致）、通常 PC モードでもライブ定常 `414〜435ms` で速度低下なしを確認。
+  - 理由: iPhone Safari で参照抽出中にメモリ不足でページが強制リロードされる問題を解消しつつ、PC 環境の高速キャッシュ性能をそのまま維持するため。
 - **参照音声の「高密度連続区間」自動切り出しを実装（秒数維持のまま無音率 `34.5% → 19.4%`・発話類似度 `0.361 → 0.428`）**:
   - 参照音声を短縮した場合（3.0秒 `258fr` → 2.0秒 `172fr` / 1.5秒 `129fr`）を Chrome WebGPU 実機＋CUDA ONNX で実測検証したところ、`dit_student_fp16.onnx`（351MB・4,440ノード）は短系列域でメモリ帯域・ディスパッチ律速のため `229ms → 220ms`（たった `9ms` 差）しか変わらず、逆に 1.5秒化で歌唱ピーク上昇・ASR微低下を招くことが判明。
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `pickBestReferenceSegment(audio, sampleRate, maxSec, focusSec)` を追加し、秒数（ライブ 3.0秒 / オフライン 8.0秒 / CAMPPlus 15秒）を一切短縮せず・つなぎ目編集もせず、参照音声全体から「先頭 3.0秒の発話密度が最大かつ 3.0秒終端が静かに切れる連続区間」を O(N) で自動選択するよう改修（短尺音声や全無音音声も安全にフォールバック）。

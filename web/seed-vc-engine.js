@@ -306,13 +306,40 @@
       this.sessions = new Map();
       this.ortLock = Promise.resolve();
       this.warmedShapes = new Set();
+      this.lowMemoryMode = false;
       this.resetStream();
+    }
+
+    detectLowMemoryDevice() {
+      if (typeof location !== "undefined") {
+        const lm = new URLSearchParams(location.search).get("low_mem");
+        if (lm === "1" || lm === "true") return true;
+        if (lm === "0" || lm === "false") return false;
+      }
+      if (typeof navigator === "undefined") return false;
+      const ua = navigator.userAgent || "";
+      const isIOS =
+        /iPad|iPhone|iPod/.test(ua) ||
+        (navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1);
+      const isMobile = isIOS || /Android|Mobile/i.test(ua);
+      const lowDeviceMem = typeof navigator.deviceMemory === "number" && navigator.deviceMemory <= 4;
+      return isMobile || lowDeviceMem;
     }
 
     async load(ort, onProgress = () => {}) {
       this.ort = ort;
-      this.hasWebGpu = typeof navigator !== "undefined" && Boolean(navigator.gpu);
-      this.backendLabel = this.hasWebGpu ? "WebGPU (FP16)" : "WASM (FP16)";
+      this.lowMemoryMode = this.detectLowMemoryDevice();
+      let gpuOk = false;
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          gpuOk = Boolean(adapter);
+        } catch (_) {
+          gpuOk = false;
+        }
+      }
+      this.hasWebGpu = gpuOk;
+      this.backendLabel = `${this.hasWebGpu ? "WebGPU (FP16)" : "WASM (FP16)"}${this.lowMemoryMode ? " [省メモリ]" : ""}`;
       onProgress("メルフィルタバンク読込中...");
 
       const modelBase = getModelBase();
@@ -379,6 +406,41 @@
       };
     }
 
+    async releaseSession(filename) {
+      const keysToDelete = [];
+      for (const [k, sess] of this.sessions.entries()) {
+        if (!filename || k.startsWith(`${filename}:`)) {
+          keysToDelete.push([k, sess]);
+        }
+      }
+      for (const [k, sess] of keysToDelete) {
+        this.sessions.delete(k);
+        if (sess && typeof sess.release === "function") {
+          try {
+            await sess.release();
+          } catch (_) {}
+        }
+      }
+    }
+
+    async releaseOtherSessions(keepFilename) {
+      let releasedAny = false;
+      for (const [k, sess] of Array.from(this.sessions.entries())) {
+        if (keepFilename && k.startsWith(`${keepFilename}:`)) continue;
+        this.sessions.delete(k);
+        releasedAny = true;
+        if (sess && typeof sess.release === "function") {
+          try {
+            await sess.release();
+          } catch (_) {}
+        }
+      }
+      if (releasedAny) {
+        // Yield briefly so Safari/WebKit can reclaim released GPU/WASM buffers before next allocation
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    }
+
     async getSession(filename, preferWebGpu = true) {
       const cpuParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("seedvc_cpu") : null;
       if (cpuParam && (cpuParam === "all" || filename.includes(cpuParam))) {
@@ -387,6 +449,10 @@
       const key = `${filename}:${preferWebGpu ? "gpu" : "cpu"}`;
       if (this.sessions.has(key)) {
         return this.sessions.get(key);
+      }
+      // On iOS / low-memory devices, never hold multiple large ONNX sessions simultaneously
+      if (this.lowMemoryMode) {
+        await this.releaseOtherSessions(filename);
       }
       const sess = await this.createSession(filename, preferWebGpu);
       this.sessions.set(key, sess);
@@ -761,6 +827,7 @@
       } finally {
         if (typeof inp.dispose === "function") try { inp.dispose(); } catch (_) {}
         disposeTensorMap(res);
+        if (this.lowMemoryMode) await this.releaseSession("whisper_small_enc.onnx");
       }
     }
 
@@ -936,24 +1003,29 @@
             } finally {
               if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
               disposeTensorMap(res);
+              if (this.lowMemoryMode) await this.releaseSession("fcpe.onnx");
             }
           }
           const fullF0 = new Float32Array(nFrames);
-          for (let off = 0; off < nFrames; off += maxWin) {
-            const len = Math.min(maxWin, nFrames - off);
-            const slice = mel.subarray(off * 128, (off + len) * 128);
-            const melTensor = new this.ort.Tensor("float32", slice, [1, len, 128]);
-            let res = null;
-            try {
-              res = await this.runSession(sess, { mel: melTensor });
-              const logits = res[sess.outputNames[0]].data;
-              const partF0 = this.decodeFcpeF0(logits, len, 0.10);
-              fullF0.set(partF0, off);
-            } finally {
-              if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
-              disposeTensorMap(res);
+          try {
+            for (let off = 0; off < nFrames; off += maxWin) {
+              const len = Math.min(maxWin, nFrames - off);
+              const slice = mel.subarray(off * 128, (off + len) * 128);
+              const melTensor = new this.ort.Tensor("float32", slice, [1, len, 128]);
+              let res = null;
+              try {
+                res = await this.runSession(sess, { mel: melTensor });
+                const logits = res[sess.outputNames[0]].data;
+                const partF0 = this.decodeFcpeF0(logits, len, 0.10);
+                fullF0.set(partF0, off);
+              } finally {
+                if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
+                disposeTensorMap(res);
+              }
+              await new Promise((r) => setTimeout(r, 0));
             }
-            await new Promise((r) => setTimeout(r, 0));
+          } finally {
+            if (this.lowMemoryMode) await this.releaseSession("fcpe.onnx");
           }
           return fullF0;
         } catch (err) {
@@ -1124,6 +1196,8 @@
       } finally {
         if (typeof fbTensor.dispose === "function") try { fbTensor.dispose(); } catch (_) {}
         disposeTensorMap(cpRes);
+        // CAMPPlus is only needed once during reference registration; release immediately on all devices
+        await this.releaseSession("campplus_fp16.onnx");
       }
 
       onProgress("Length Regulator 処理中 (参照)...");
@@ -1141,6 +1215,7 @@
       } finally {
         disposeTensorMap(lrFeeds);
         disposeTensorMap(lrRes);
+        if (this.lowMemoryMode) await this.releaseSession("length_regulator_fp16.onnx");
       }
 
       const f0Med = this.computeVoicedF0Median(F0_ori);
@@ -1159,12 +1234,19 @@
         seconds: ref44.length / SR_OUT,
         ditCache: new Map(),
       };
-      // Warm only the live-streaming shape on reference registration (~3x faster setup);
-      // offline long-window shapes compile on-demand if ever used.
-      await this.warmupShaders(
-        [{ winFrames: 96, maxPromptFrames: 258, nSteps: 1, cfgRate: 0.0 }],
-        onProgress
-      );
+      // On desktop WebGPU, warm the live-streaming shape ahead of time.
+      // On iOS / low-memory devices, skip pre-loading DiT (335MB) + BigVGAN (468MB)
+      // during reference registration to avoid Safari Jetsam OOM tab reloads.
+      if (!this.lowMemoryMode) {
+        try {
+          await this.warmupShaders(
+            [{ winFrames: 96, maxPromptFrames: 258, nSteps: 1, cfgRate: 0.0 }],
+            onProgress
+          );
+        } catch (warmErr) {
+          console.warn("[Seed-VC] warmupShaders skipped due to error:", warmErr);
+        }
+      }
       return {
         seconds: this.ref.seconds,
         frames: T_prompt,
@@ -1237,6 +1319,7 @@
       } finally {
         disposeTensorMap(lrFeeds);
         disposeTensorMap(lrRes);
+        if (this.lowMemoryMode) await this.releaseSession("length_regulator_fp16.onnx");
       }
       let ditFrames = T_src;
       const ditTailFrames = Number(opts.ditTailFrames || 0);
@@ -1354,6 +1437,7 @@
           }
         } finally {
           disposeTensorMap({ xLensTensor, pxTensor, cTensor, sTensor });
+          if (this.lowMemoryMode) await this.releaseSession("dit_student_fp16.onnx");
         }
       } else {
         const pxIn = new Float32Array(2 * 128 * T_total);
@@ -1367,7 +1451,8 @@
         const cTensor = new this.ort.Tensor("float32", cIn, [2, T_total, 768]);
         const sTensor = new this.ort.Tensor("float32", sIn, [2, 192]);
 
-        const ditSess = await this.getSession(useStudentMicroCfg ? "dit_student_fp16.onnx" : "dit_estimator_fp16.onnx", true);
+        const ditFile = useStudentMicroCfg ? "dit_student_fp16.onnx" : "dit_estimator_fp16.onnx";
+        const ditSess = await this.getSession(ditFile, true);
         const xIn = new Float32Array(2 * 128 * T_total);
         const tSpan = new Float32Array(nSteps + 1);
         const sway = useStudentMicroCfg ? 0.0 : -0.8;
@@ -1414,6 +1499,7 @@
           }
         } finally {
           disposeTensorMap({ xLensTensor, pxTensor, cTensor, sTensor });
+          if (this.lowMemoryMode) await this.releaseSession(ditFile);
         }
       }
       const tDitMs = performance.now() - tD0;
@@ -1427,7 +1513,8 @@
       onProgress("BigVGAN 44.1kHz 波形生成中...");
       const tB0 = performance.now();
       const useBvFp16 = typeof location !== "undefined" && new URLSearchParams(location.search).has("bigvgan_fp16");
-      const bvSess = await this.getSession(useBvFp16 ? "bigvgan_fp16.onnx" : "bigvgan.onnx", true);
+      const bvFile = useBvFp16 ? "bigvgan_fp16.onnx" : "bigvgan.onnx";
+      const bvSess = await this.getSession(bvFile, true);
       const melTensor = new this.ort.Tensor("float32", vcTarget, [1, 128, T_src]);
       let bvRes = null;
       let outWav;
@@ -1437,6 +1524,7 @@
       } finally {
         if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
         disposeTensorMap(bvRes);
+        if (this.lowMemoryMode) await this.releaseSession(bvFile);
       }
       const tBigvganMs = performance.now() - tB0;
 
@@ -1521,6 +1609,7 @@
       } finally {
         disposeTensorMap(lrFeeds);
         disposeTensorMap(lrRes);
+        if (this.lowMemoryMode) await this.releaseSession("length_regulator_fp16.onnx");
       }
 
       const srcEnv = this.computeSmoothEnv(src44, T_full, 512, 10);
