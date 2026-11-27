@@ -1,6 +1,17 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **パイプライン全体の非効率箇所を一括最適化（ベンチマーク `437ms → 411ms / RTF 0.411`・GCスパイク完全解消・参照登録 `11.3s → 0.21s`・高域欠損解消）**:
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に以下を実装：
+    - 全5メルフィルタバンク（`whisper`, `rmvpe`, `kaldi`, `bigvgan`, `fcpe`）の非ゼロ帯域のみ計算する疎ループ化（`buildSparseBank`、演算量 41〜65倍削減・全バンク `maxDiff === 0` ビット完全一致）＋Hann窓とFFT作業バッファの事前確保・再利用。
+    - 全 ONNX 入出力テンソルへの `try/finally` 明示 `.dispose()`（`disposeTensorMap`）導入により、ライブ推論中の WebGPU VRAM 蓄積による `+111ms` GC スパイクを解消。
+    - `runDitAndBigvgan` に形状別キャッシュ `this.ref.ditCache`（決定論ノイズ `baseX` の Box-Muller 再計算廃止、`promptX` / `catCond` / `xBuf` / `vcTarget` 再利用）を追加し、`nSteps === 1` 時の不要なプロンプト区間ゼロクリアとライブ時の不要 RMS/peak 二重走査（`skipStats`）を省略。
+    - `setReference` 時の WebGPU シェーダ事前コンパイルをライブ用 `96fr` のみへ限定（オフライン用 `540fr` は必要時オンデマンド化）。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に以下を実装（UI変更ゼロ）：
+    - 参照音声アップロード時にアクティブエンジンのネイティブ周波数（Seed-VC 時は `44.1kHz`）で直接デコードするよう改修し、従来の `44.1k → 24k → 44.1k` 二重リサンプルによる 12〜22kHz 高域欠損を解消（エンジン切替時は FlowVC のみ `24kHz` へ自動リサンプル）。
+    - Seed-VC ライブ入力キューを `Array.push/shift`＋毎コールバック `Float32Array` 生成からゼロ確保の固定長リングバッファへ置換し、`setTimeout(10)` ポーリングをイベント駆動 Promise 待機へ変更、さらに `el.meterIn` DOM 更新を 15Hz（`>=66ms`）へスロットル。
+  - Chrome WebGPU 実機検証（JSエラー 0件）：1.0秒ベンチマーク **`411ms (RTF 0.411, [W:16ms Y:13ms D:225ms BV:130ms])`**、ライブ 464ms チャンク全4本が **`427〜461ms (RTF 0.920〜0.993, D:219〜234ms)`** で GC スパイクなし、参照音声登録 **`205.9ms`**（ウォーム時）、オフライン `?test=chunk_stream` も正常完了（`2419ms / 5.99s`）。
+  - 理由: コード全体監査で特定した 8件のCPU/GPU/GC/リサンプル無駄を、音質劣化やUI変更を一切伴わずに根本から削減するため。
 - **Seed-VC ライブ推論の大幅高速化＆変換ラグ解消（1.0秒ベンチマーク `569ms → 437ms` / 過去最速 `RTF 0.437`）**:
   - 「以前より重くなり変換ラグが大きくなった」原因をプロファイル特定：①ライブ過去コンテキストを `160fr (2.41s)` に広げたことで Whisper が `W150 → W300`（Attention 4倍）・FCPE が `112 → 242fr`（2.2倍）へ膨張していたこと、②[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `convertAudio` がフレーム数 `T_src` を得るためだけに未使用の `computeBigvganMel(src44)`（2048点 STFT + 128×1025 行列積、約 35〜60ms/チャンク）を毎チャンク実行していたこと、③`computeWhisperFeatures` が素朴な $O(N^2)$ 201×400 DFT を使っていたこと。
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) で①未使用の `computeBigvganMel(src44)` を厳密な整数式 `Math.floor((src44.length + 1536 - 2048) / 512) + 1` へ置換、②`streamWhisperCtxSamples` を `72fr (L72/C40/R8 = 120fr = 1.39s)` へ最適化して超高速 `W150` バケット（`<=140fr`）へ復帰しつつ従来 `L48` の1.5倍の過去文脈を維持、③400点 DFT を厳密な 16×25 実数 Cooley-Tukey FFT（相対誤差 `1e-7`, 7.3倍高速 `23.3ms -> 3.2ms`）へ置換。

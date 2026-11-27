@@ -156,7 +156,9 @@
     isFileLoopback: false,
     lastRefAudio: null,
     lastRefLabel: null,
+    lastRefSampleRate: SAMPLE_RATE,
     extractedRefByEngine: {},
+    wakeSeedvcStream: null,
   };
 
   // DOM Elements
@@ -287,17 +289,18 @@
     return Boolean(state.spkEmbData);
   }
 
-  async function extractSpeakerEmbedding(float32Audio, label = "参照音声", updateUi = true) {
+  async function extractSpeakerEmbedding(float32Audio, label = "参照音声", updateUi = true, audioSampleRate = SAMPLE_RATE) {
     if (updateUi) {
       state.lastRefAudio = float32Audio;
       state.lastRefLabel = label;
+      state.lastRefSampleRate = audioSampleRate;
     }
     if (state.engine === "seedvc") {
       if (!state.seedvcReady || !state.seedvcEngine) {
         throw new Error("Seed-VC エンジンがまだ初期化されていません。");
       }
       if (updateUi) el.refStatus.textContent = "Seed-VC 参照抽出中...";
-      const res = await state.seedvcEngine.setReference(float32Audio, SAMPLE_RATE, (msg) => {
+      const res = await state.seedvcEngine.setReference(float32Audio, audioSampleRate, (msg) => {
         if (updateUi) el.refStatus.textContent = msg;
       });
       if (updateUi) {
@@ -316,7 +319,7 @@
         throw new Error("kNN-VC モデルがまだロードされていません。");
       }
       if (updateUi) el.refStatus.textContent = "kNN 特徴抽出中...";
-      const res = await state.knnEngine.setReference(float32Audio, SAMPLE_RATE, (w, tot) => {
+      const res = await state.knnEngine.setReference(float32Audio, audioSampleRate, (w, tot) => {
         if (updateUi) el.refStatus.textContent = `kNN 特徴抽出中 (${w}/${tot})...`;
       });
       if (updateUi) {
@@ -333,9 +336,14 @@
       throw new Error("モデルがまだロードされていません。");
     }
 
+    const flowAudio =
+      audioSampleRate === SAMPLE_RATE
+        ? float32Audio
+        : await resampleFloat32Mono(float32Audio, audioSampleRate, SAMPLE_RATE);
+
     // Ensure at least 240 samples and trim/pad cleanly around 3 seconds
-    const usableLen = Math.max(240, Math.min(float32Audio.length, SAMPLE_RATE * 10));
-    const inputAudio = float32Audio.subarray(0, usableLen);
+    const usableLen = Math.max(240, Math.min(flowAudio.length, SAMPLE_RATE * 10));
+    const inputAudio = flowAudio.subarray(0, usableLen);
     const refTensor = new ort.Tensor("float32", inputAudio, [1, usableLen]);
 
     const t0 = performance.now();
@@ -587,6 +595,20 @@
     return rendered.getChannelData(0);
   }
 
+  async function resampleFloat32Mono(audio, srcRate, dstRate) {
+    if (srcRate === dstRate) return audio;
+    const dstLen = Math.max(240, Math.round((audio.length * dstRate) / srcRate));
+    const offline = new OfflineAudioContext(1, dstLen, dstRate);
+    const buf = offline.createBuffer(1, audio.length, srcRate);
+    buf.copyToChannel(audio, 0);
+    const src = offline.createBufferSource();
+    src.buffer = buf;
+    src.connect(offline.destination);
+    src.start(0);
+    const rendered = await offline.startRendering();
+    return new Float32Array(rendered.getChannelData(0));
+  }
+
   async function decodeAudioFileToMono(file, targetRate = SAMPLE_RATE) {
     const arrayBuf = await file.arrayBuffer();
     const decodeCtx = new OfflineAudioContext(1, 1, targetRate);
@@ -594,16 +616,19 @@
     return await resampleBufferToMono(decoded, targetRate);
   }
 
-  async function decodeAudioFileTo24kMono(file) {
-    return await decodeAudioFileToMono(file, SAMPLE_RATE);
-  }
-
   async function handleFileUpload(file) {
     if (!file) return;
     try {
-      log(`参照音声をデコード中: ${file.name}`);
-      const mono24k = await decodeAudioFileTo24kMono(file);
-      await extractSpeakerEmbedding(mono24k, file.name);
+      // Decode directly at the active engine's native sample rate to preserve 12-22kHz highs for Seed-VC
+      const targetRate =
+        state.engine === "seedvc" && window.SeedVcEngine
+          ? window.SeedVcEngine.SAMPLE_RATE
+          : state.engine === "knn" && window.KnnVcEngine
+            ? window.KnnVcEngine.SAMPLE_RATE
+            : SAMPLE_RATE;
+      log(`参照音声をデコード中: ${file.name} (${targetRate} Hz)`);
+      const mono = await decodeAudioFileToMono(file, targetRate);
+      await extractSpeakerEmbedding(mono, file.name, true, targetRate);
     } catch (err) {
       log(`ファイル読込エラー: ${err.message}`);
     }
@@ -857,24 +882,55 @@
         state.seedvcEngine.resetStream();
         const chunkSamples = state.seedvcEngine.streamChunkSamples; // 40 * 512 = 20,480 (~0.464s)
         const rightMargin = state.seedvcEngine.streamRightSamples;  // 8 * 512 = 4,096 (~93ms)
-        const micQueue = [];
-        let micQueuedSamples = 0;
+        const needSamples = chunkSamples + rightMargin;
+        // Zero-allocation circular ring buffer (avoids Array push/shift & per-callback Float32Array GC)
+        const maxQueued = isFileMode
+          ? chunkSamples * 8 + rightMargin
+          : chunkSamples * 2 + rightMargin;
+        const ringCap = maxQueued + 4096;
+        const ringBuf = new Float32Array(ringCap);
+        let ringRead = 0;
+        let ringWrite = 0;
+        let ringCount = 0;
+        let wakeConsumer = null;
+        let lastMeterInMs = 0;
+
+        const wakeIfWaiting = () => {
+          if (wakeConsumer) {
+            const w = wakeConsumer;
+            wakeConsumer = null;
+            w();
+          }
+        };
+        state.wakeSeedvcStream = wakeIfWaiting;
 
         proc.onaudioprocess = (ev) => {
           if (!state.isStreaming) return;
           const inp = ev.inputBuffer.getChannelData(0);
-          micQueue.push(new Float32Array(inp));
-          micQueuedSamples += inp.length;
-          // Drop oldest excess for live mic so latency stays bounded; keep larger buffer for file loopback
-          const maxQueued = isFileMode
-            ? chunkSamples * 8 + rightMargin
-            : chunkSamples * 2 + rightMargin;
-          while (micQueuedSamples > maxQueued && micQueue.length > 1) {
-            const dropped = micQueue.shift();
-            micQueuedSamples -= dropped.length;
+          const n = inp.length;
+          const first = Math.min(n, ringCap - ringWrite);
+          ringBuf.set(inp.subarray(0, first), ringWrite);
+          if (first < n) {
+            ringBuf.set(inp.subarray(first), 0);
           }
-          const rms = computeRms(inp);
-          el.meterIn.style.width = `${Math.min(100, rms * 350)}%`;
+          ringWrite = (ringWrite + n) % ringCap;
+          ringCount += n;
+          // Drop oldest excess in O(1) so live latency stays bounded
+          if (ringCount > maxQueued) {
+            const excess = ringCount - maxQueued;
+            ringRead = (ringRead + excess) % ringCap;
+            ringCount = maxQueued;
+          }
+          if (ringCount >= needSamples) {
+            wakeIfWaiting();
+          }
+          // Throttle input meter DOM updates to ~15Hz instead of 43Hz audio callback rate
+          const nowMs = performance.now();
+          if (nowMs - lastMeterInMs >= 66) {
+            lastMeterInMs = nowMs;
+            const rms = computeRms(inp);
+            el.meterIn.style.width = `${Math.min(100, rms * 350)}%`;
+          }
         };
         source.connect(proc);
         proc.connect(silentGain);
@@ -893,40 +949,33 @@
           log(`Seed-VC リアルタイムストリーミング開始 (SR: ${ctx.sampleRate} Hz, チャンク: 0.46s / 左文脈0.56s / 3sプロンプト)`);
         }
 
-        const pullSamples = (n) => {
-          const out = new Float32Array(n);
-          let off = 0;
-          while (off < n && micQueue.length > 0) {
-            const head = micQueue[0];
-            const take = Math.min(n - off, head.length);
-            out.set(head.subarray(0, take), off);
-            off += take;
-            micQueuedSamples -= take;
-            if (take < head.length) {
-              micQueue[0] = head.subarray(take);
-            } else {
-              micQueue.shift();
-            }
+        const readRing = (dst, n, consume) => {
+          const first = Math.min(n, ringCap - ringRead);
+          dst.set(ringBuf.subarray(ringRead, ringRead + first), 0);
+          if (first < n) {
+            dst.set(ringBuf.subarray(0, n - first), first);
           }
-          return out;
+          if (consume) {
+            ringRead = (ringRead + n) % ringCap;
+            ringCount -= n;
+          }
         };
 
+        const pieceBuf = new Float32Array(chunkSamples);
+        const rightBuf = new Float32Array(rightMargin);
         let nextPlayTime = 0;
         (async () => {
           while (state.isStreaming && state.audioCtx === ctx) {
-            if (micQueuedSamples < chunkSamples + rightMargin) {
-              await new Promise((r) => setTimeout(r, 10));
+            if (ringCount < needSamples) {
+              await new Promise((r) => {
+                wakeConsumer = r;
+              });
               continue;
             }
-            const piece = pullSamples(chunkSamples);
-            // Peek rightMargin from head of micQueue without consuming it
-            const rightCtx = new Float32Array(rightMargin);
-            let rOff = 0;
-            for (let q = 0; q < micQueue.length && rOff < rightMargin; q++) {
-              const take = Math.min(rightMargin - rOff, micQueue[q].length);
-              rightCtx.set(micQueue[q].subarray(0, take), rOff);
-              rOff += take;
-            }
+            readRing(pieceBuf, chunkSamples, true);
+            readRing(rightBuf, rightMargin, false);
+            const piece = pieceBuf;
+            const rightCtx = rightBuf;
             try {
               let outAudio;
               let outRms;
@@ -1048,6 +1097,10 @@
     state.isStreaming = false;
     state.isFileLoopback = false;
     state.pendingChunk = null;
+    if (typeof state.wakeSeedvcStream === "function") {
+      state.wakeSeedvcStream();
+      state.wakeSeedvcStream = null;
+    }
 
     if (wasFileLoopback && el.fileLoopbackAudio && !el.fileLoopbackAudio.paused) {
       el.fileLoopbackAudio.pause();
@@ -1293,7 +1346,12 @@
     if (state.lastRefAudio && state.extractedRefByEngine[state.engine] !== state.lastRefAudio) {
       try {
         log(`切替先エンジンで参照音声 [${state.lastRefLabel || "参照音声"}] を自動抽出中...`);
-        await extractSpeakerEmbedding(state.lastRefAudio, state.lastRefLabel || "参照音声", true);
+        await extractSpeakerEmbedding(
+          state.lastRefAudio,
+          state.lastRefLabel || "参照音声",
+          true,
+          state.lastRefSampleRate || SAMPLE_RATE
+        );
       } catch (err) {
         log(`参照自動抽出エラー: ${err.message}`);
       }

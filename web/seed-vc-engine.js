@@ -90,6 +90,31 @@
     return w;
   }
 
+  function buildSparseBank(data, rows, cols) {
+    const starts = new Int32Array(rows);
+    const ends = new Int32Array(rows);
+    for (let m = 0; m < rows; m++) {
+      const off = m * cols;
+      let s = 0;
+      while (s < cols && data[off + s] === 0) s++;
+      let e = cols - 1;
+      while (e >= s && data[off + e] === 0) e--;
+      starts[m] = s;
+      ends[m] = e;
+    }
+    return { data, rows, cols, starts, ends };
+  }
+
+  function disposeTensorMap(map, skipSet = null) {
+    if (!map) return;
+    for (const k of Object.keys(map)) {
+      const t = map[k];
+      if (t && (!skipSet || !skipSet.has(t)) && typeof t.dispose === "function") {
+        try { t.dispose(); } catch (_) {}
+      }
+    }
+  }
+
   function resample44to16Fast(src44) {
     const n = src44.length;
     const dstLen = Math.max(1, Math.round((n * SR_16K) / SR_OUT));
@@ -176,6 +201,18 @@
       this.backendLabel = "WASM";
       this.banks = null;
       this.bankData = null;
+      this.sparseBanks = {};
+      this.hann400 = periodicHann(400);
+      this.hann1024 = periodicHann(1024);
+      this.hann2048 = periodicHann(2048);
+      this.wFrame = new Float32Array(400);
+      this.wPow = new Float32Array(201);
+      this.fcRe = new Float32Array(1024);
+      this.fcIm = new Float32Array(1024);
+      this.fcMag = new Float32Array(513);
+      this.bvRe = new Float32Array(2048);
+      this.bvIm = new Float32Array(2048);
+      this.bvMag = new Float32Array(1025);
       this.wD25Cos = null;
       this.wD25Sin = null;
       this.wTwCos = null;
@@ -215,6 +252,16 @@
       const buf = await binRes.arrayBuffer();
       this.bankData = new Float32Array(buf);
       this.fcpeMelBank = fcpeMelRes && fcpeMelRes.ok ? new Float32Array(await fcpeMelRes.arrayBuffer()) : null;
+
+      // Precompute non-zero frequency ranges for sparse mel matmuls (~8-12x faster, bit-exact)
+      this.sparseBanks = {};
+      for (const name of Object.keys(this.banks)) {
+        const b = this.getBank(name);
+        this.sparseBanks[name] = buildSparseBank(b.data, b.rows, b.cols);
+      }
+      if (this.fcpeMelBank) {
+        this.sparseBanks.fcpe = buildSparseBank(this.fcpeMelBank, 128, 513);
+      }
 
       // Precompute exact 400-point (16 x 25) Cooley-Tukey FFT tables for Whisper (~7x faster than naive DFT)
       this.wD25Cos = new Float32Array(25 * 25);
@@ -281,6 +328,9 @@
     }
 
     async dispose() {
+      if (this.ref && this.ref.ditCache) {
+        this.ref.ditCache.clear();
+      }
       for (const sess of this.sessions.values()) {
         try {
           await sess.release();
@@ -321,13 +371,16 @@
       paddedSig.set(wav16.subarray(0, activeLen));
 
       const nFreq = 201;
-      const win = periodicHann(nFft);
+      const win = this.hann400;
       const sig = reflectPad(paddedSig, 200, 200);
-      const bank = this.getBank("whisper");
+      const bank = this.sparseBanks.whisper;
+      const bStarts = bank.starts;
+      const bEnds = bank.ends;
+      const bData = bank.data;
       const out = new Float32Array(80 * nFrames);
 
-      const frame = new Float32Array(nFft);
-      const pow = new Float32Array(nFreq);
+      const frame = this.wFrame;
+      const pow = this.wPow;
       const activeFrames = Math.min(nFrames, Math.ceil(activeLen / hop));
 
       const d25Cos = this.wD25Cos;
@@ -393,9 +446,10 @@
         }
         for (let m = 0; m < 80; m++) {
           const bOff = m * nFreq;
+          const kEnd = bEnds[m];
           let acc = 0;
-          for (let k = 0; k < nFreq; k++) {
-            acc += bank.data[bOff + k] * pow[k];
+          for (let k = bStarts[m]; k <= kEnd; k++) {
+            acc += bData[bOff + k] * pow[k];
           }
           const v = Math.log10(Math.max(acc, 1e-10));
           out[m * nFrames + t] = v;
@@ -422,17 +476,20 @@
       const nFft = 1024;
       const hop = 160;
       const nFreq = 513;
-      const win = periodicHann(nFft);
+      const win = this.hann1024;
       const sig = reflectPad(wav16, nFft / 2, nFft / 2);
       const nFrames = Math.floor((sig.length - nFft) / hop) + 1;
       const nPad = 32 * Math.ceil(nFrames / 32) - nFrames;
       const totalFrames = nFrames + nPad;
-      const bank = this.getBank("rmvpe");
+      const bank = this.sparseBanks.rmvpe;
+      const bStarts = bank.starts;
+      const bEnds = bank.ends;
+      const bData = bank.data;
       const out = new Float32Array(128 * totalFrames);
 
-      const re = new Float32Array(nFft);
-      const im = new Float32Array(nFft);
-      const mag = new Float32Array(nFreq);
+      const re = this.fcRe;
+      const im = this.fcIm;
+      const mag = this.fcMag;
 
       for (let t = 0; t < nFrames; t++) {
         const off = t * hop;
@@ -446,9 +503,10 @@
         }
         for (let m = 0; m < 128; m++) {
           const bOff = m * nFreq;
+          const kEnd = bEnds[m];
           let acc = 0;
-          for (let k = 0; k < nFreq; k++) {
-            acc += bank.data[bOff + k] * mag[k];
+          for (let k = bStarts[m]; k <= kEnd; k++) {
+            acc += bData[bOff + k] * mag[k];
           }
           out[m * totalFrames + t] = Math.log(Math.max(acc, 1e-5));
         }
@@ -502,7 +560,10 @@
       for (let i = 0; i < frameLen; i++) {
         povey[i] = Math.pow(0.5 - 0.5 * Math.cos((2.0 * Math.PI * i) / (frameLen - 1)), 0.85);
       }
-      const bank = this.getBank("kaldi");
+      const bank = this.sparseBanks.kaldi;
+      const bStarts = bank.starts;
+      const bEnds = bank.ends;
+      const bData = bank.data;
       const out = new Float32Array(numFrames * 80);
       const colMeans = new Float32Array(80);
 
@@ -536,9 +597,10 @@
         }
         for (let m = 0; m < 80; m++) {
           const bOff = m * nFreq;
+          const kEnd = bEnds[m];
           let acc = 0;
-          for (let k = 0; k < nFreq; k++) {
-            acc += bank.data[bOff + k] * pow[k];
+          for (let k = bStarts[m]; k <= kEnd; k++) {
+            acc += bData[bOff + k] * pow[k];
           }
           const v = Math.log(Math.max(acc, 1.1920929e-7));
           out[t * 80 + m] = v;
@@ -560,15 +622,18 @@
       const hop = 512;
       const nFreq = 1025;
       const pad = (nFft - hop) / 2; // 768
-      const win = periodicHann(nFft);
+      const win = this.hann2048;
       const sig = reflectPad(wav44, pad, pad);
       const nFrames = Math.floor((sig.length - nFft) / hop) + 1;
-      const bank = this.getBank("bigvgan");
+      const bank = this.sparseBanks.bigvgan;
+      const bStarts = bank.starts;
+      const bEnds = bank.ends;
+      const bData = bank.data;
       const out = new Float32Array(128 * nFrames);
 
-      const re = new Float32Array(nFft);
-      const im = new Float32Array(nFft);
-      const mag = new Float32Array(nFreq);
+      const re = this.bvRe;
+      const im = this.bvIm;
+      const mag = this.bvMag;
 
       for (let t = 0; t < nFrames; t++) {
         const off = t * hop;
@@ -582,9 +647,10 @@
         }
         for (let m = 0; m < 128; m++) {
           const bOff = m * nFreq;
+          const kEnd = bEnds[m];
           let acc = 0;
-          for (let k = 0; k < nFreq; k++) {
-            acc += bank.data[bOff + k] * mag[k];
+          for (let k = bStarts[m]; k <= kEnd; k++) {
+            acc += bData[bOff + k] * mag[k];
           }
           out[m * nFrames + t] = Math.log(Math.max(acc, 1e-5));
         }
@@ -609,11 +675,17 @@
       const nFrames = Math.floor((wav16.length / SR_16K) * 50);
       const sess = await this.getSession("whisper_small_enc.onnx", true);
       const inp = new this.ort.Tensor("float32", feats, [1, 80, winFrames]);
-      const res = await this.runSession(sess, { input_features: inp });
-      const full = res.hidden_states.data; // (1, winFrames/2, 768)
-      const out = new Float32Array(nFrames * 768);
-      out.set(full.subarray(0, Math.min(full.length, nFrames * 768)));
-      return { data: out, frames: nFrames };
+      let res = null;
+      try {
+        res = await this.runSession(sess, { input_features: inp });
+        const full = res.hidden_states.data; // (1, winFrames/2, 768)
+        const out = new Float32Array(nFrames * 768);
+        out.set(full.subarray(0, Math.min(full.length, nFrames * 768)));
+        return { data: out, frames: nFrames };
+      } finally {
+        if (typeof inp.dispose === "function") try { inp.dispose(); } catch (_) {}
+        disposeTensorMap(res);
+      }
     }
 
     computeYinF0(wav16) {
@@ -701,15 +773,18 @@
       const hop = 160;
       const nFreq = 513;
       const pad = 512;
-      const win = periodicHann(nFft);
+      const win = this.hann1024;
       const sig = reflectPad(wav16, pad, pad);
       const nFrames = Math.floor((sig.length - nFft) / hop) + 1;
-      const bank = this.fcpeMelBank;
+      const bank = this.sparseBanks.fcpe;
+      const bStarts = bank.starts;
+      const bEnds = bank.ends;
+      const bData = bank.data;
       const out = new Float32Array(nFrames * 128);
 
-      const re = new Float32Array(nFft);
-      const im = new Float32Array(nFft);
-      const mag = new Float32Array(nFreq);
+      const re = this.fcRe;
+      const im = this.fcIm;
+      const mag = this.fcMag;
 
       for (let t = 0; t < nFrames; t++) {
         const off = t * hop;
@@ -724,9 +799,10 @@
         const rowOut = t * 128;
         for (let m = 0; m < 128; m++) {
           const bOff = m * nFreq;
+          const kEnd = bEnds[m];
           let acc = 0;
-          for (let k = 0; k < nFreq; k++) {
-            acc += bank[bOff + k] * mag[k];
+          for (let k = bStarts[m]; k <= kEnd; k++) {
+            acc += bData[bOff + k] * mag[k];
           }
           out[rowOut + m] = Math.log(Math.max(acc, 1e-5));
         }
@@ -775,22 +851,32 @@
           // Process in <=500-frame (5s) windows so O(T^2) attention in WASM never freezes the UI thread
           const maxWin = 500;
           if (nFrames <= maxWin) {
-            const res = await this.runSession(sess, {
-              mel: new this.ort.Tensor("float32", mel, [1, nFrames, 128]),
-            });
-            const logits = res[sess.outputNames[0]].data;
-            return this.decodeFcpeF0(logits, nFrames, 0.10);
+            const melTensor = new this.ort.Tensor("float32", mel, [1, nFrames, 128]);
+            let res = null;
+            try {
+              res = await this.runSession(sess, { mel: melTensor });
+              const logits = res[sess.outputNames[0]].data;
+              return this.decodeFcpeF0(logits, nFrames, 0.10);
+            } finally {
+              if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
+              disposeTensorMap(res);
+            }
           }
           const fullF0 = new Float32Array(nFrames);
           for (let off = 0; off < nFrames; off += maxWin) {
             const len = Math.min(maxWin, nFrames - off);
             const slice = mel.subarray(off * 128, (off + len) * 128);
-            const res = await this.runSession(sess, {
-              mel: new this.ort.Tensor("float32", slice, [1, len, 128]),
-            });
-            const logits = res[sess.outputNames[0]].data;
-            const partF0 = this.decodeFcpeF0(logits, len, 0.10);
-            fullF0.set(partF0, off);
+            const melTensor = new this.ort.Tensor("float32", slice, [1, len, 128]);
+            let res = null;
+            try {
+              res = await this.runSession(sess, { mel: melTensor });
+              const logits = res[sess.outputNames[0]].data;
+              const partF0 = this.decodeFcpeF0(logits, len, 0.10);
+              fullF0.set(partF0, off);
+            } finally {
+              if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
+              disposeTensorMap(res);
+            }
             await new Promise((r) => setTimeout(r, 0));
           }
           return fullF0;
@@ -951,20 +1037,38 @@
       const { fbank, numFrames: fbFrames } = this.computeKaldiFbank(style16);
       const cpSess = await this.getSession("campplus_fp16.onnx", true);
       const fbTensor = new this.ort.Tensor("float32", fbank, [1, fbFrames, 80]);
-      const cpRes = await this.runSession(cpSess, { fbank: fbTensor });
-      const style2 = new Float32Array(cpRes[cpSess.outputNames[0]].data);
+      let cpRes = null;
+      let style2;
+      try {
+        cpRes = await this.runSession(cpSess, { fbank: fbTensor });
+        style2 = new Float32Array(cpRes[cpSess.outputNames[0]].data);
+      } finally {
+        if (typeof fbTensor.dispose === "function") try { fbTensor.dispose(); } catch (_) {}
+        disposeTensorMap(cpRes);
+      }
 
       onProgress("Length Regulator 処理中 (参照)...");
       const lrSess = await this.getSession("length_regulator_fp16.onnx", true);
-      const lrRes = await this.runSession(lrSess, {
+      const lrFeeds = {
         semantic: new this.ort.Tensor("float32", S_ori.data, [1, S_ori.frames, 768]),
         ylens: new this.ort.Tensor("int64", BigInt64Array.from([BigInt(T_prompt)]), [1]),
         f0: new this.ort.Tensor("float32", F0_ori, [1, F0_ori.length]),
-      });
-      const promptCond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      };
+      let lrRes = null;
+      let promptCond;
+      try {
+        lrRes = await this.runSession(lrSess, lrFeeds);
+        promptCond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      } finally {
+        disposeTensorMap(lrFeeds);
+        disposeTensorMap(lrRes);
+      }
 
       const f0Med = this.computeVoicedF0Median(F0_ori);
       const { mean: sOriMean, std: sOriStd } = this.computeFeatureStats(S_ori.data, S_ori.frames, 768, ref16);
+      if (this.ref && this.ref.ditCache) {
+        this.ref.ditCache.clear();
+      }
       this.ref = {
         mel2,
         T_prompt,
@@ -974,12 +1078,12 @@
         sOriMean,
         sOriStd,
         seconds: ref44.length / SR_OUT,
+        ditCache: new Map(),
       };
+      // Warm only the live-streaming shape on reference registration (~3x faster setup);
+      // offline long-window shapes compile on-demand if ever used.
       await this.warmupShaders(
-        [
-          { winFrames: 540, maxPromptFrames: 0, nSteps: 1, cfgRate: 0.0 },
-          { winFrames: 96, maxPromptFrames: 258, nSteps: 1, cfgRate: 0.0 },
-        ],
+        [{ winFrames: 96, maxPromptFrames: 258, nSteps: 1, cfgRate: 0.0 }],
         onProgress
       );
       return {
@@ -1001,7 +1105,7 @@
         if (this.warmedShapes.has(key)) continue;
         onProgress(`WebGPU シェーダ事前コンパイル中 (${winFrames}fr)...`);
         const dummyCond = new Float32Array(winFrames * 768);
-        await this.runDitAndBigvgan(dummyCond, winFrames, 1, cfgRate, () => {}, maxPromptFrames);
+        await this.runDitAndBigvgan(dummyCond, winFrames, 1, cfgRate, () => {}, maxPromptFrames, true);
         this.warmedShapes.add(key);
       }
     }
@@ -1041,16 +1145,24 @@
 
       onProgress("Length Regulator 処理中 (変換元)...");
       const lrSess = await this.getSession("length_regulator_fp16.onnx", true);
-      const lrRes = await this.runSession(lrSess, {
+      const lrFeeds = {
         semantic: new this.ort.Tensor("float32", S_alt.data, [1, S_alt.frames, 768]),
         ylens: new this.ort.Tensor("int64", BigInt64Array.from([BigInt(T_src)]), [1]),
         f0: new this.ort.Tensor("float32", F0_alt, [1, F0_alt.length]),
-      });
-      let cond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      };
+      let lrRes = null;
+      let cond;
+      try {
+        lrRes = await this.runSession(lrSess, lrFeeds);
+        cond = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      } finally {
+        disposeTensorMap(lrFeeds);
+        disposeTensorMap(lrRes);
+      }
       let ditFrames = T_src;
       const ditTailFrames = Number(opts.ditTailFrames || 0);
       if (ditTailFrames > 0 && ditTailFrames < T_src) {
-        cond = cond.slice((T_src - ditTailFrames) * 768);
+        cond = cond.subarray((T_src - ditTailFrames) * 768);
         ditFrames = ditTailFrames;
       }
       const { outWav, tDitMs, tBigvganMs, rms, peak } = await this.runDitAndBigvgan(
@@ -1059,7 +1171,8 @@
         nSteps,
         cfgRate,
         onProgress,
-        maxPromptFrames
+        maxPromptFrames,
+        Boolean(opts.skipStats)
       );
 
       return {
@@ -1072,30 +1185,51 @@
       };
     }
 
-    async runDitAndBigvgan(cond, T_src, nSteps, cfgRate, onProgress = () => {}, maxPromptFrames = 0) {
+    async runDitAndBigvgan(cond, T_src, nSteps, cfgRate, onProgress = () => {}, maxPromptFrames = 0, skipStats = false) {
       // Concatenate promptCond (1, T_prompt, 768) + cond (1, T_src, 768) -> (1, T_total, 768)
       const T_fullPrompt = this.ref.T_prompt;
       const T_prompt = maxPromptFrames > 0 ? Math.min(T_fullPrompt, maxPromptFrames) : T_fullPrompt;
       const T_total = T_prompt + T_src;
-      const catCond = new Float32Array(T_total * 768);
-      catCond.set(this.ref.promptCond.subarray(0, T_prompt * 768), 0);
+
+      // Reuse deterministic noise baseX, promptX, and scratch buffers per (T_prompt, T_src)
+      if (!this.ref.ditCache) this.ref.ditCache = new Map();
+      const cacheKey = `${T_prompt}:${T_src}`;
+      let entry = this.ref.ditCache.get(cacheKey);
+      if (!entry) {
+        const catCond = new Float32Array(T_total * 768);
+        catCond.set(this.ref.promptCond.subarray(0, T_prompt * 768), 0);
+
+        const randn = makeRng(42);
+        const baseX = new Float32Array(128 * T_total);
+        for (let i = 0; i < baseX.length; i++) baseX[i] = randn();
+        for (let c = 0; c < 128; c++) {
+          const row = c * T_total;
+          for (let t = 0; t < T_prompt; t++) baseX[row + t] = 0.0;
+        }
+
+        const promptX = new Float32Array(128 * T_total);
+        for (let c = 0; c < 128; c++) {
+          const dstRow = c * T_total;
+          const srcRow = c * T_fullPrompt;
+          promptX.set(this.ref.mel2.subarray(srcRow, srcRow + T_prompt), dstRow);
+        }
+
+        entry = {
+          catCond,
+          baseX,
+          xBuf: new Float32Array(128 * T_total),
+          promptX,
+          vcTarget: new Float32Array(128 * T_src),
+          xLens1: BigInt64Array.from([BigInt(T_total)]),
+        };
+        this.ref.ditCache.set(cacheKey, entry);
+      }
+
+      const catCond = entry.catCond;
       catCond.set(cond, T_prompt * 768);
-
-      // Prepare DiT inputs (batch=2: [cond, uncond])
-      const randn = makeRng(42);
-      const x = new Float32Array(128 * T_total);
-      for (let i = 0; i < x.length; i++) x[i] = randn();
-      for (let c = 0; c < 128; c++) {
-        const row = c * T_total;
-        for (let t = 0; t < T_prompt; t++) x[row + t] = 0.0;
-      }
-
-      const promptX = new Float32Array(128 * T_total);
-      for (let c = 0; c < 128; c++) {
-        const dstRow = c * T_total;
-        const srcRow = c * T_fullPrompt;
-        promptX.set(this.ref.mel2.subarray(srcRow, srcRow + T_prompt), dstRow);
-      }
+      const x = entry.xBuf;
+      x.set(entry.baseX);
+      const promptX = entry.promptX;
 
       const tD0 = performance.now();
       const useStudentNoCfg = cfgRate <= 0;
@@ -1103,29 +1237,44 @@
       if (useStudentNoCfg) {
         // Distilled 1-2 step No-CFG Student (batch=1)
         const ditSess = await this.getSession("dit_student_fp16.onnx", true);
-        const xLensTensor = new this.ort.Tensor("int64", BigInt64Array.from([BigInt(T_total)]), [1]);
+        const xLensTensor = new this.ort.Tensor("int64", entry.xLens1, [1]);
         const pxTensor = new this.ort.Tensor("float32", promptX, [1, 128, T_total]);
         const cTensor = new this.ort.Tensor("float32", catCond, [1, T_total, 768]);
         const sTensor = new this.ort.Tensor("float32", this.ref.style2, [1, 192]);
         const dt = 1.0 / nSteps;
         const stride = 128 * T_total;
-        for (let step = 0; step < nSteps; step++) {
-          onProgress(`蒸留DiT 推論中 (${step + 1}/${nSteps})...`);
-          const tCur = step / nSteps;
-          const vRes = await this.runSession(ditSess, {
-            x: new this.ort.Tensor("float32", x, [1, 128, T_total]),
-            prompt_x: pxTensor,
-            x_lens: xLensTensor,
-            t: new this.ort.Tensor("float32", new Float32Array([tCur]), [1]),
-            style: sTensor,
-            cond: cTensor,
-          });
-          const v = vRes[ditSess.outputNames[0]].data;
-          for (let i = 0; i < stride; i++) x[i] += dt * v[i];
-          for (let c = 0; c < 128; c++) {
-            const row = c * T_total;
-            for (let t = 0; t < T_prompt; t++) x[row + t] = 0.0;
+        try {
+          for (let step = 0; step < nSteps; step++) {
+            onProgress(`蒸留DiT 推論中 (${step + 1}/${nSteps})...`);
+            const tCur = step / nSteps;
+            const xTensor = new this.ort.Tensor("float32", x, [1, 128, T_total]);
+            const tTensor = new this.ort.Tensor("float32", new Float32Array([tCur]), [1]);
+            let vRes = null;
+            try {
+              vRes = await this.runSession(ditSess, {
+                x: xTensor,
+                prompt_x: pxTensor,
+                x_lens: xLensTensor,
+                t: tTensor,
+                style: sTensor,
+                cond: cTensor,
+              });
+              const v = vRes[ditSess.outputNames[0]].data;
+              for (let i = 0; i < stride; i++) x[i] += dt * v[i];
+            } finally {
+              if (typeof xTensor.dispose === "function") try { xTensor.dispose(); } catch (_) {}
+              if (typeof tTensor.dispose === "function") try { tTensor.dispose(); } catch (_) {}
+              disposeTensorMap(vRes);
+            }
+            if (step + 1 < nSteps) {
+              for (let c = 0; c < 128; c++) {
+                const row = c * T_total;
+                for (let t = 0; t < T_prompt; t++) x[row + t] = 0.0;
+              }
+            }
           }
+        } finally {
+          disposeTensorMap({ xLensTensor, pxTensor, cTensor, sTensor });
         }
       } else {
         const pxIn = new Float32Array(2 * 128 * T_total);
@@ -1147,35 +1296,50 @@
           const u = i / nSteps;
           tSpan[i] = u + sway * (Math.cos(Math.PI * 0.5 * u) - 1.0 + u);
         }
-        for (let step = 0; step < nSteps; step++) {
-          onProgress(`${useStudentMicroCfg ? "蒸留DiT micro-CFG" : "DiT Flow Matching"} 推論中 (${step + 1}/${nSteps})...`);
-          const tCur = tSpan[step];
-          const dt = tSpan[step + 1] - tSpan[step];
-          xIn.set(x, 0);
-          xIn.set(x, 128 * T_total);
-          const vRes = await this.runSession(ditSess, {
-            x: new this.ort.Tensor("float32", xIn, [2, 128, T_total]),
-            prompt_x: pxTensor,
-            x_lens: xLensTensor,
-            t: new this.ort.Tensor("float32", new Float32Array([tCur, tCur]), [2]),
-            style: sTensor,
-            cond: cTensor,
-          });
-          const vBoth = vRes[ditSess.outputNames[0]].data;
-          const stride = 128 * T_total;
-          for (let i = 0; i < stride; i++) {
-            const dphi = (1.0 + cfgRate) * vBoth[i] - cfgRate * vBoth[stride + i];
-            x[i] += dt * dphi;
+        try {
+          for (let step = 0; step < nSteps; step++) {
+            onProgress(`${useStudentMicroCfg ? "蒸留DiT micro-CFG" : "DiT Flow Matching"} 推論中 (${step + 1}/${nSteps})...`);
+            const tCur = tSpan[step];
+            const dt = tSpan[step + 1] - tSpan[step];
+            xIn.set(x, 0);
+            xIn.set(x, 128 * T_total);
+            const xTensor = new this.ort.Tensor("float32", xIn, [2, 128, T_total]);
+            const tTensor = new this.ort.Tensor("float32", new Float32Array([tCur, tCur]), [2]);
+            let vRes = null;
+            try {
+              vRes = await this.runSession(ditSess, {
+                x: xTensor,
+                prompt_x: pxTensor,
+                x_lens: xLensTensor,
+                t: tTensor,
+                style: sTensor,
+                cond: cTensor,
+              });
+              const vBoth = vRes[ditSess.outputNames[0]].data;
+              const stride = 128 * T_total;
+              for (let i = 0; i < stride; i++) {
+                const dphi = (1.0 + cfgRate) * vBoth[i] - cfgRate * vBoth[stride + i];
+                x[i] += dt * dphi;
+              }
+            } finally {
+              if (typeof xTensor.dispose === "function") try { xTensor.dispose(); } catch (_) {}
+              if (typeof tTensor.dispose === "function") try { tTensor.dispose(); } catch (_) {}
+              disposeTensorMap(vRes);
+            }
+            if (step + 1 < nSteps) {
+              for (let c = 0; c < 128; c++) {
+                const row = c * T_total;
+                for (let t = 0; t < T_prompt; t++) x[row + t] = 0.0;
+              }
+            }
           }
-          for (let c = 0; c < 128; c++) {
-            const row = c * T_total;
-            for (let t = 0; t < T_prompt; t++) x[row + t] = 0.0;
-          }
+        } finally {
+          disposeTensorMap({ xLensTensor, pxTensor, cTensor, sTensor });
         }
       }
       const tDitMs = performance.now() - tD0;
 
-      const vcTarget = new Float32Array(128 * T_src);
+      const vcTarget = entry.vcTarget;
       for (let c = 0; c < 128; c++) {
         const srcOff = c * T_total + T_prompt;
         vcTarget.set(x.subarray(srcOff, srcOff + T_src), c * T_src);
@@ -1185,11 +1349,21 @@
       const tB0 = performance.now();
       const useBvFp16 = typeof location !== "undefined" && new URLSearchParams(location.search).has("bigvgan_fp16");
       const bvSess = await this.getSession(useBvFp16 ? "bigvgan_fp16.onnx" : "bigvgan.onnx", true);
-      const bvRes = await this.runSession(bvSess, {
-        mel: new this.ort.Tensor("float32", vcTarget, [1, 128, T_src]),
-      });
-      const outWav = new Float32Array(bvRes[bvSess.outputNames[0]].data);
+      const melTensor = new this.ort.Tensor("float32", vcTarget, [1, 128, T_src]);
+      let bvRes = null;
+      let outWav;
+      try {
+        bvRes = await this.runSession(bvSess, { mel: melTensor });
+        outWav = new Float32Array(bvRes[bvSess.outputNames[0]].data);
+      } finally {
+        if (typeof melTensor.dispose === "function") try { melTensor.dispose(); } catch (_) {}
+        disposeTensorMap(bvRes);
+      }
       const tBigvganMs = performance.now() - tB0;
+
+      if (skipStats) {
+        return { outWav, tDitMs, tBigvganMs, rms: 0, peak: 0 };
+      }
 
       let peak = 0;
       let sumSq = 0;
@@ -1255,12 +1429,20 @@
 
       onProgress("Length Regulator 処理中 (変換元全体)...");
       const lrSess = await this.getSession("length_regulator_fp16.onnx", true);
-      const lrRes = await this.runSession(lrSess, {
+      const lrFeeds = {
         semantic: new this.ort.Tensor("float32", sData, [1, sFrames, 768]),
         ylens: new this.ort.Tensor("int64", BigInt64Array.from([BigInt(T_full)]), [1]),
         f0: new this.ort.Tensor("float32", f0, [1, f0.length]),
-      });
-      const condFull = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      };
+      let lrRes = null;
+      let condFull;
+      try {
+        lrRes = await this.runSession(lrSess, lrFeeds);
+        condFull = new Float32Array(lrRes[lrSess.outputNames[0]].data);
+      } finally {
+        disposeTensorMap(lrFeeds);
+        disposeTensorMap(lrRes);
+      }
 
       const srcEnv = this.computeSmoothEnv(src44, T_full, 512, 10);
       return { condFull, T_full, src44, srcEnv };
@@ -1340,12 +1522,14 @@
 
       const nSteps = Number(opts.steps ?? 4);
       const cfgRate = Number(opts.cfgRate ?? 0.85);
-      const { outWav, tDitMs, tBigvganMs, rms, peak } = await this.runDitAndBigvgan(
+      const { outWav, tDitMs, tBigvganMs } = await this.runDitAndBigvgan(
         condWin,
         winFrames,
         nSteps,
         cfgRate,
-        onProgress
+        onProgress,
+        0,
+        true
       );
 
       const startOff = leftFrames * 512 - xfade;
@@ -1469,6 +1653,7 @@
           maxPromptFrames: opts.maxPromptFrames ?? 258,
           ditTailFrames: 96,
           isStream: true,
+          skipStats: true,
         },
         onProgress
       );
