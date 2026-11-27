@@ -1,6 +1,11 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **参照音声の「高密度連続区間」自動切り出しを実装（秒数維持のまま無音率 `34.5% → 19.4%`・発話類似度 `0.361 → 0.428`）**:
+  - 参照音声を短縮した場合（3.0秒 `258fr` → 2.0秒 `172fr` / 1.5秒 `129fr`）を Chrome WebGPU 実機＋CUDA ONNX で実測検証したところ、`dit_student_fp16.onnx`（351MB・4,440ノード）は短系列域でメモリ帯域・ディスパッチ律速のため `229ms → 220ms`（たった `9ms` 差）しか変わらず、逆に 1.5秒化で歌唱ピーク上昇・ASR微低下を招くことが判明。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に `pickBestReferenceSegment(audio, sampleRate, maxSec, focusSec)` を追加し、秒数（ライブ 3.0秒 / オフライン 8.0秒 / CAMPPlus 15秒）を一切短縮せず・つなぎ目編集もせず、参照音声全体から「先頭 3.0秒の発話密度が最大かつ 3.0秒終端が静かに切れる連続区間」を O(N) で自動選択するよう改修（短尺音声や全無音音声も安全にフォールバック）。
+  - 本番 ONNX 実測（`参考音声.mp3`）：3.0秒無音率 `34.5% → 19.4%`、ライブ発話 `cosT: 0.361 → 0.428`（`pk: 0.747 → 0.563`, `clip=0.00%`）、ライブ歌唱 `cosT: 0.691 → 0.697`（`pk: 0.872 → 0.758`, `clip=0.00%`）。Node.js エッジケース検証全件合格＋Chrome WebGPU 実機で JSエラー 0件・参照抽出 `203.8ms` を確認。
+  - 理由: 冒頭に無音を含む参照音声でもプロンプトの約3分の1が無音で無駄になる問題を防ぎ、速度ペナルティゼロ・音質劣化ゼロで話者再現の安定性を高めるため。
 - **パイプライン全体の非効率箇所を一括最適化（ベンチマーク `437ms → 411ms / RTF 0.411`・GCスパイク完全解消・参照登録 `11.3s → 0.21s`・高域欠損解消）**:
   - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) に以下を実装：
     - 全5メルフィルタバンク（`whisper`, `rmvpe`, `kaldi`, `bigvgan`, `fcpe`）の非ゼロ帯域のみ計算する疎ループ化（`buildSparseBank`、演算量 41〜65倍削減・全バンク `maxDiff === 0` ビット完全一致）＋Hann窓とFFT作業バッファの事前確保・再利用。

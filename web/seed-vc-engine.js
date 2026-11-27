@@ -115,6 +115,82 @@
     }
   }
 
+  // Pick the best continuous reference segment (full length preserved, zero splice edits)
+  // that maximizes active speech density in the primary live window (`focusSec`) while
+  // keeping strong overall density across `maxSec` and preferring a clean, quiet tail at `focusSec`.
+  function pickBestReferenceSegment(audio, sampleRate, maxSec = 8.0, focusSec = 3.0) {
+    const n = audio.length;
+    const maxLen = Math.round(sampleRate * maxSec);
+    const focusLen = Math.round(sampleRate * focusSec);
+    if (n <= focusLen) return audio;
+
+    const hop = Math.max(1, Math.round(sampleRate * 0.02)); // 20ms frames
+    const nFrames = Math.floor(n / hop);
+    const focusF = Math.max(1, Math.floor(focusLen / hop));
+    const maxF = Math.min(nFrames, Math.max(focusF, Math.floor(maxLen / hop)));
+    if (nFrames <= focusF) return audio.subarray(0, Math.min(n, maxLen));
+
+    const rms = new Float32Array(nFrames);
+    for (let f = 0; f < nFrames; f++) {
+      const off = f * hop;
+      let sq = 0;
+      for (let i = 0; i < hop; i++) {
+        const v = audio[off + i];
+        sq += v * v;
+      }
+      rms[f] = Math.sqrt(sq / hop + 1e-12);
+    }
+
+    const sortedRms = new Float32Array(rms);
+    sortedRms.sort();
+    const p95 = sortedRms[Math.min(nFrames - 1, Math.floor(nFrames * 0.95))];
+    if (p95 < 1e-4) return audio.subarray(0, Math.min(n, maxLen));
+
+    const thr = Math.max(0.01, p95 * 0.12);
+    const csAct = new Float32Array(nFrames + 1);
+    const csRms = new Float32Array(nFrames + 1);
+    for (let f = 0; f < nFrames; f++) {
+      csAct[f + 1] = csAct[f] + (rms[f] >= thr ? 1.0 : 0.0);
+      csRms[f + 1] = csRms[f] + rms[f];
+    }
+
+    const candEndF = nFrames > maxF ? nFrames - maxF : nFrames - focusF;
+    let bestF = 0;
+    let bestScore = -1e9;
+    const invP95 = 1.0 / (p95 + 1e-6);
+    for (let f = 0; f <= candEndF; f++) {
+      const actFocus = (csAct[f + focusF] - csAct[f]) / focusF;
+      const endMax = Math.min(nFrames, f + maxF);
+      const actMax = (csAct[endMax] - csAct[f]) / Math.max(1, endMax - f);
+      const meanRmsFocus = (csRms[f + focusF] - csRms[f]) / focusF;
+
+      const tailStart = Math.max(f, f + focusF - 3);
+      let tailSum = 0;
+      for (let k = tailStart; k < f + focusF; k++) tailSum += rms[k];
+      const tailBonus = tailSum / Math.max(1, f + focusF - tailStart) < thr ? 0.06 : 0.0;
+
+      const headEnd = Math.min(nFrames, f + 3);
+      let headSum = 0;
+      for (let k = f; k < headEnd; k++) headSum += rms[k];
+      const headBonus = headSum / Math.max(1, headEnd - f) >= thr ? 0.03 : 0.0;
+
+      const score =
+        0.70 * actFocus +
+        0.25 * actMax +
+        0.05 * Math.min(1.0, meanRmsFocus * invP95) +
+        tailBonus +
+        headBonus;
+      if (score > bestScore) {
+        bestScore = score;
+        bestF = f;
+      }
+    }
+
+    const start = bestF * hop;
+    const end = Math.min(n, start + maxLen);
+    return audio.subarray(start, end);
+  }
+
   function resample44to16Fast(src44) {
     const n = src44.length;
     const dstLen = Math.max(1, Math.round((n * SR_16K) / SR_OUT));
@@ -1006,12 +1082,15 @@
 
     async setReference(audioFloat32, sampleRate, onProgress = () => {}) {
       const t0 = performance.now();
-      // DiT acoustic prompt uses up to 8s (~688 frames) for crisp 1-3kHz vocal timbre;
-      // CAMPPlus speaker embedding is O(1) w.r.t. DiT attention so it can use up to 15s.
-      const maxPromptSamples = Math.min(audioFloat32.length, Math.round(sampleRate * 8));
-      const maxStyleSamples = Math.min(audioFloat32.length, Math.round(sampleRate * 15));
-      const trimmedPrompt = audioFloat32.subarray(0, maxPromptSamples);
-      const trimmedStyle = audioFloat32.subarray(0, maxStyleSamples);
+      // DiT acoustic prompt uses up to 8s (~688 frames) for crisp 1-3kHz vocal timbre,
+      // automatically selecting the cleanest high-density continuous window (prioritizing
+      // the first 3.0s used in live streaming without shortening duration or splicing).
+      // CAMPPlus speaker embedding is O(1) w.r.t. DiT attention so it uses up to 15s.
+      const trimmedPrompt = pickBestReferenceSegment(audioFloat32, sampleRate, 8.0, 3.0);
+      const trimmedStyle =
+        audioFloat32.length > Math.round(sampleRate * 15)
+          ? pickBestReferenceSegment(audioFloat32, sampleRate, 15.0, 15.0)
+          : audioFloat32;
 
       const rawRef44 = await resampleAudio(trimmedPrompt, sampleRate, SR_OUT);
       // Append 40ms smooth fade-out + 80ms clean silence tail so DiT never leaks
@@ -1025,9 +1104,9 @@
       }
       const ref16 = await resampleAudio(ref44, SR_OUT, SR_16K);
       const style16 =
-        maxStyleSamples > maxPromptSamples
-          ? await resampleAudio(trimmedStyle, sampleRate, SR_16K)
-          : ref16;
+        trimmedStyle === trimmedPrompt
+          ? ref16
+          : await resampleAudio(trimmedStyle, sampleRate, SR_16K);
 
       const { mel: mel2, nFrames: T_prompt } = this.computeBigvganMel(ref44);
       const S_ori = await this.runWhisper(ref16, "参照音声", onProgress);
