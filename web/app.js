@@ -1363,6 +1363,34 @@
         log(`[CHUNK_TEST ERR] ${e.message}`);
       }
     });
+  } else if (location.search.includes("test=live_stream")) {
+    state.engine = "seedvc";
+    if (el.engineSelect) el.engineSelect.value = "seedvc";
+    initModels().then(async () => {
+      try {
+        const sr = window.SeedVcEngine.SAMPLE_RATE;
+        const ref = generateSyntheticReferenceAudio(8.0, 220.0);
+        await state.seedvcEngine.setReference(ref, sr);
+        state.seedvcEngine.resetStream();
+        const chunkLen = state.seedvcEngine.streamChunkSamples; // 40 * 512 = 20480 (464.4ms)
+        const rightLen = state.seedvcEngine.streamRightSamples; // 8 * 512 = 4096
+        const src = generateSyntheticReferenceAudio(4.0, 330.0);
+        for (let c = 0; c < 5; c++) {
+          const piece = src.subarray(c * chunkLen, (c + 1) * chunkLen);
+          const rightCtx = src.subarray((c + 1) * chunkLen, (c + 1) * chunkLen + rightLen);
+          const conv = await state.seedvcEngine.convertChunkStream(piece, { pitchShift: 0, steps: 1, cfgRate: 0.0, rightCtx });
+          const durMs = (piece.length / sr) * 1000;
+          const rtf = conv.elapsedMs / durMs;
+          const tm = conv.timings
+            ? `[W:${conv.timings.tWhisperMs.toFixed(0)}ms Y:${conv.timings.tYinMs.toFixed(0)}ms D:${conv.timings.tDitMs.toFixed(0)}ms BV:${conv.timings.tBigvganMs.toFixed(0)}ms]`
+            : "";
+          log(`[LIVE_TEST c=${c + 1}] ms=${conv.elapsedMs.toFixed(0)}/${durMs.toFixed(0)} rtf=${rtf.toFixed(3)} pk=${conv.peak.toFixed(3)} rms=${conv.rms.toFixed(3)} ${tm}`);
+        }
+        log("[LIVE_TEST DONE]");
+      } catch (e) {
+        log(`[LIVE_TEST ERR] ${e.message}`);
+      }
+    });
   } else {
     state.engine = (el.engineSelect && el.engineSelect.value) || "seedvc";
     initModels();

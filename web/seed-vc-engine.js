@@ -176,8 +176,14 @@
       this.backendLabel = "WASM";
       this.banks = null;
       this.bankData = null;
-      this.whisperCos = null;
-      this.whisperSin = null;
+      this.wD25Cos = null;
+      this.wD25Sin = null;
+      this.wTwCos = null;
+      this.wTwSin = null;
+      this.wD16Cos = null;
+      this.wD16Sin = null;
+      this.wTmpRe = new Float32Array(400);
+      this.wTmpIm = new Float32Array(400);
       this.fft512 = makeFft(512);
       this.fft1024 = makeFft(1024);
       this.fft2048 = makeFft(2048);
@@ -210,17 +216,32 @@
       this.bankData = new Float32Array(buf);
       this.fcpeMelBank = fcpeMelRes && fcpeMelRes.ok ? new Float32Array(await fcpeMelRes.arrayBuffer()) : null;
 
-      // Precompute 400-point DFT tables for Whisper (201 x 400)
-      const nFft = 400;
-      const nFreq = 201;
-      this.whisperCos = new Float32Array(nFreq * nFft);
-      this.whisperSin = new Float32Array(nFreq * nFft);
-      for (let k = 0; k < nFreq; k++) {
-        const base = k * nFft;
-        for (let n = 0; n < nFft; n++) {
-          const ang = (-2.0 * Math.PI * k * n) / nFft;
-          this.whisperCos[base + n] = Math.cos(ang);
-          this.whisperSin[base + n] = Math.sin(ang);
+      // Precompute exact 400-point (16 x 25) Cooley-Tukey FFT tables for Whisper (~7x faster than naive DFT)
+      this.wD25Cos = new Float32Array(25 * 25);
+      this.wD25Sin = new Float32Array(25 * 25);
+      for (let k = 0; k < 25; k++) {
+        for (let n = 0; n < 25; n++) {
+          const ang = (-2.0 * Math.PI * k * n) / 25;
+          this.wD25Cos[k * 25 + n] = Math.cos(ang);
+          this.wD25Sin[k * 25 + n] = Math.sin(ang);
+        }
+      }
+      this.wTwCos = new Float32Array(400);
+      this.wTwSin = new Float32Array(400);
+      for (let k2 = 0; k2 < 25; k2++) {
+        for (let n1 = 0; n1 < 16; n1++) {
+          const ang = (-2.0 * Math.PI * k2 * n1) / 400;
+          this.wTwCos[k2 * 16 + n1] = Math.cos(ang);
+          this.wTwSin[k2 * 16 + n1] = Math.sin(ang);
+        }
+      }
+      this.wD16Cos = new Float32Array(16 * 16);
+      this.wD16Sin = new Float32Array(16 * 16);
+      for (let k = 0; k < 16; k++) {
+        for (let n = 0; n < 16; n++) {
+          const ang = (-2.0 * Math.PI * k * n) / 16;
+          this.wD16Cos[k * 16 + n] = Math.cos(ang);
+          this.wD16Sin[k * 16 + n] = Math.sin(ang);
         }
       }
       onProgress(`準備完了 (${this.backendLabel})`);
@@ -309,6 +330,15 @@
       const pow = new Float32Array(nFreq);
       const activeFrames = Math.min(nFrames, Math.ceil(activeLen / hop));
 
+      const d25Cos = this.wD25Cos;
+      const d25Sin = this.wD25Sin;
+      const twCos = this.wTwCos;
+      const twSin = this.wTwSin;
+      const d16Cos = this.wD16Cos;
+      const d16Sin = this.wD16Sin;
+      const tRe = this.wTmpRe;
+      const tIm = this.wTmpIm;
+
       // Compute log10 mel spectrogram for active frames; fill silent remainder with min value
       let globalMax = -1e9;
       for (let t = 0; t < activeFrames; t++) {
@@ -316,16 +346,50 @@
         for (let n = 0; n < nFft; n++) {
           frame[n] = sig[off + n] * win[n];
         }
-        for (let k = 0; k < nFreq; k++) {
-          const base = k * nFft;
-          let re = 0;
-          let im = 0;
-          for (let n = 0; n < nFft; n++) {
-            const x = frame[n];
-            re += x * this.whisperCos[base + n];
-            im += x * this.whisperSin[base + n];
+        // Exact 400-pt (16x25) real Cooley-Tukey FFT -> power[0..200]
+        for (let n1 = 0; n1 < 16; n1++) {
+          let s0 = 0;
+          for (let n2 = 0; n2 < 25; n2++) s0 += frame[n2 * 16 + n1];
+          tRe[n1] = s0;
+          tIm[n1] = 0;
+          for (let k2 = 1; k2 <= 12; k2++) {
+            const b = k2 * 25;
+            let re = 0;
+            let im = 0;
+            for (let n2 = 0; n2 < 25; n2++) {
+              const v = frame[n2 * 16 + n1];
+              re += v * d25Cos[b + n2];
+              im += v * d25Sin[b + n2];
+            }
+            const twIdx = k2 * 16 + n1;
+            const tc = twCos[twIdx];
+            const ts = twSin[twIdx];
+            tRe[twIdx] = re * tc - im * ts;
+            tIm[twIdx] = re * ts + im * tc;
+            const twcIdx = (25 - k2) * 16 + n1;
+            const tcc = twCos[twcIdx];
+            const tsc = twSin[twcIdx];
+            tRe[twcIdx] = re * tcc + im * tsc;
+            tIm[twcIdx] = re * tsc - im * tcc;
           }
-          pow[k] = re * re + im * im;
+        }
+        for (let k2 = 0; k2 < 25; k2++) {
+          const row = k2 * 16;
+          const k1Max = k2 === 0 ? 8 : 7;
+          for (let k1 = 0; k1 <= k1Max; k1++) {
+            const dOff = k1 * 16;
+            let re = 0;
+            let im = 0;
+            for (let n1 = 0; n1 < 16; n1++) {
+              const xr = tRe[row + n1];
+              const xi = tIm[row + n1];
+              const c = d16Cos[dOff + n1];
+              const s = d16Sin[dOff + n1];
+              re += xr * c - xi * s;
+              im += xr * s + xi * c;
+            }
+            pow[25 * k1 + k2] = re * re + im * im;
+          }
         }
         for (let m = 0; m < 80; m++) {
           const bOff = m * nFreq;
@@ -955,7 +1019,8 @@
       const src44 = sampleRate === SR_OUT ? audioFloat32 : await resampleAudio(audioFloat32, sampleRate, SR_OUT);
       const src16 = sampleRate === SR_OUT ? resample44to16Fast(src44) : await resampleAudio(audioFloat32, sampleRate, SR_16K);
 
-      const { nFrames: T_src } = this.computeBigvganMel(src44);
+      // Compute exact BigVGAN mel frame count without wasting ~40ms computing an unused 2048-pt STFT + mel matmul
+      const T_src = Math.floor((src44.length + 1536 - 2048) / 512) + 1;
       const tW0 = performance.now();
       const S_alt = await this.runWhisper(src16, "変換元", onProgress);
       if (opts.useAdain !== false) {
@@ -1327,7 +1392,10 @@
     }
 
     resetStream() {
-      this.streamWhisperCtxSamples = 160 * 512; // 81,920 samples (~1.86s past context for Whisper/FCPE, 0ms added latency)
+      // 72 + 40 + 8 = 120 frames (~1.39s -> 139 Whisper mel frames <= 140),
+      // keeping Whisper in the ultra-fast W150 bucket (4x faster attention than W300)
+      // while still giving 1.5x longer past context than DiT's 48 frames with 0ms extra latency.
+      this.streamWhisperCtxSamples = 72 * 512;  // 36,864 samples (~836ms past context for Whisper/FCPE)
       this.streamCtxSamples = 48 * 512;         // 24,576 samples (~557ms left context for DiT/BigVGAN)
       this.streamChunkSamples = 40 * 512;       // 20,480 samples (~464ms low-latency hop)
       this.streamRightSamples = 8 * 512;        // 4,096 samples (~93ms right context, discarded from output)

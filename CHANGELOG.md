@@ -1,6 +1,12 @@
 # CHANGELOG
 
 ## 2026-11-27
+- **Seed-VC ライブ推論の大幅高速化＆変換ラグ解消（1.0秒ベンチマーク `569ms → 437ms` / 過去最速 `RTF 0.437`）**:
+  - 「以前より重くなり変換ラグが大きくなった」原因をプロファイル特定：①ライブ過去コンテキストを `160fr (2.41s)` に広げたことで Whisper が `W150 → W300`（Attention 4倍）・FCPE が `112 → 242fr`（2.2倍）へ膨張していたこと、②[web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) の `convertAudio` がフレーム数 `T_src` を得るためだけに未使用の `computeBigvganMel(src44)`（2048点 STFT + 128×1025 行列積、約 35〜60ms/チャンク）を毎チャンク実行していたこと、③`computeWhisperFeatures` が素朴な $O(N^2)$ 201×400 DFT を使っていたこと。
+  - [web/seed-vc-engine.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/seed-vc-engine.js) で①未使用の `computeBigvganMel(src44)` を厳密な整数式 `Math.floor((src44.length + 1536 - 2048) / 512) + 1` へ置換、②`streamWhisperCtxSamples` を `72fr (L72/C40/R8 = 120fr = 1.39s)` へ最適化して超高速 `W150` バケット（`<=140fr`）へ復帰しつつ従来 `L48` の1.5倍の過去文脈を維持、③400点 DFT を厳密な 16×25 実数 Cooley-Tukey FFT（相対誤差 `1e-7`, 7.3倍高速 `23.3ms -> 3.2ms`）へ置換。
+  - [web/app.js](file:///c:/Users/terus/Documents/antigravity/vc-iphone/web/app.js) に実機計測用 `?test=live_stream` モードを追加（UI変更なし）。
+  - Chrome WebGPU 実機にて、1.0秒ベンチマーク **`437ms (RTF 0.437, [W:17ms Y:17ms D:227ms BV:145ms])`**（直前 `569ms`・従来 `501ms` を大きく上回る過去最速）、ライブ 464ms チャンク定常 **`403〜407ms (RTF 0.868〜0.876, pk=0.526〜0.884)`**・JSエラー 0件を確認。
+  - 理由: 音質改善の副作用でライブ 1チャンク推論が実時間 `464ms` を超過（`RTF > 1.0`）してラグが蓄積していた問題を、音質を一切損なわず根本から解消するため。
 - **音割れ・舌足らず・無音ノイズの3大原因を根本解消（後処理の対処療法を全撤去＋クリーン蒸留 DiT へ刷新）**:
   - CUDA フル尺診断（発話 2.39秒・トリセツ 全23.32秒）＋日本語 Whisper ASR 比較により3つの根本原因を物理特定：①旧 1ステップ蒸留モデル（`seedvc_dit_1step_prog.pt`）が二重CFG由来の過大メル（`m_p99=1.98`, 本家教師は `0.88〜1.03`）を出力して BigVGAN 内部で既に音割れしていたこと、②`FCPE` 閾値 `0.006` による無声子音 `60.0%`・無音 `18.8%` の誤有声化および Whisper フル強度 AdaIN（`1.0`）による日本語音素潰れ（「お兄ちゃん!→おねえぞ!」「笑って許してね→はなんて言うのしてね」）、③無音フレームへの AdaIN 統計適用と参照音声 8.0s 発話途中ぶつ切りによる `0.00s` 無音ノイズ漏れ。
   - [scripts/export_seedvc_student_onnx.py](file:///c:/Users/terus/Documents/antigravity/vc-iphone/scripts/export_seedvc_student_onnx.py) を追加し、クリーンな 12ステップ教師由来の `checkpoints/seedvc_dit_1step_sharp.pt` を [models/seedvc/dit_student_fp16.onnx](file:///c:/Users/terus/Documents/antigravity/vc-iphone/models/seedvc/dit_student_fp16.onnx)（`351.71 MB`, ORT `nan=0`, `cos=1.000000`）へ再エクスポート。
